@@ -5,9 +5,12 @@ function Home() {
   const [message, setMessage] = useState("");
   const [profile, setProfile] = useState([]);
 
+  const helloBaseUrl = process.env.REACT_APP_HELLO_BASE_URL;
+  const profileBaseUrl = process.env.REACT_APP_PROFILE_BASE_URL;
+
   useEffect(() => {
     axios
-      .get("http://localhost:3001/")
+      .get(`${helloBaseUrl}/`)
       .then((response) => {
         setMessage(response.data.msg);
       })
@@ -16,7 +19,7 @@ function Home() {
 
   useEffect(() => {
     axios
-      .get("http://localhost:3002/fetchUser")
+      .get(`${profileBaseUrl}/fetchUser`)
       .then((response) => {
         setProfile(response.data);
         

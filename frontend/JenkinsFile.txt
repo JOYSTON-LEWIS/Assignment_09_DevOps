@@ -3,9 +3,8 @@ pipeline {
 
     environment {
         // AWS & Infra Credentials
-        JL_AWS_ACCESS_KEY_ID            = credentials('JL_AWS_ACCESS_KEY_ID')
-        JL_AWS_SECRET_ACCESS_KEY        = credentials('JL_AWS_SECRET_ACCESS_KEY')
         JL_AWS_REGION_ID                = credentials('JL_AWS_REGION_ID')
+        JL_AWS_OUTPUT_FORMAT            = 'json'
         JL_AS09_EC2_IP_ADDRESS          = credentials('JL_AS09_EC2_IP_ADDRESS')
         JL_EC2_SSH_PRIVATE_KEY          = credentials('JL_EC2_SSH_PRIVATE_KEY')
 
@@ -20,12 +19,22 @@ pipeline {
 
         stage('Step 1: Install All Tools on EC2') {
             steps {
-                sshagent (credentials: ['JL_EC2_SSH_PRIVATE_KEY']) {
-                    script {
-                        def SSH_IP = env.JL_AS09_EC2_IP_ADDRESS
+                withCredentials([[
+                    $class: 'AmazonWebServicesCredentialsBinding',
+                    credentialsId: 'JL_AWS_CREDENTIALS',
+                    accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                    secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                ]]) {
+                    sshagent (credentials: ['JL_EC2_SSH_PRIVATE_KEY']) {
+                        script {
+                            def SSH_IP = env.JL_AS09_EC2_IP_ADDRESS
+                            def REGION = env.JL_AWS_REGION_ID
+                            def OUTPUT = env.JL_AWS_OUTPUT_FORMAT
+                            def ACCESS_KEY = AWS_ACCESS_KEY_ID
+                            def SECRET_KEY = AWS_SECRET_ACCESS_KEY
 
-                        sh """
-                        ssh -o StrictHostKeyChecking=no ubuntu@${SSH_IP} << 'EOF'
+                            sh """
+                            ssh -o StrictHostKeyChecking=no ubuntu@${SSH_IP} << EOF
 echo "✅ Connected to EC2"
 
 # Update system and install packages
@@ -79,21 +88,39 @@ sudo systemctl enable --now containerd
 # Install crictl
 VERSION="v1.33.1"
 wget https://github.com/kubernetes-sigs/cri-tools/releases/download/\$VERSION/crictl-\$VERSION-linux-amd64.tar.gz
-tar zxvf crictl-\$VERSION-linux-amd64.tar.gz
+tar --overwrite -xvzf crictl-\$VERSION-linux-amd64.tar.gz
 sudo install crictl /usr/local/bin/
 
 # Install CNI plugins
 wget https://github.com/containernetworking/plugins/releases/download/v1.5.0/cni-plugins-linux-amd64-v1.5.0.tgz
 sudo mkdir -p /opt/cni/bin
-sudo tar -xvzf cni-plugins-linux-amd64-v1.5.0.tgz -C /opt/cni/bin/
+sudo tar --overwrite -xvzf cni-plugins-linux-amd64-v1.5.0.tgz -C /opt/cni/bin/
 
 # Start Minikube with containerd (no driver)
 sudo CHANGE_MINIKUBE_NONE_USER=true minikube start --driver=none --container-runtime=containerd
 
 # Install boto3
 pip3 install --upgrade boto3 --break-system-packages
+
+# AWS CLI
+rm -rf aws awscliv2.zip
+curl \"https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip\" -o \"awscliv2.zip\"
+unzip -o awscliv2.zip
+sudo ./aws/install
+
+# Configure AWS CLI
+aws configure set aws_access_key_id "${ACCESS_KEY}"
+aws configure set aws_secret_access_key "${SECRET_KEY}"
+aws configure set region "${REGION}"
+aws configure set output "${OUTPUT}"
+
+echo "✅ AWS credentials configured inside EC2"
+
+rm -rf aws awscliv2.zip crictl-*.tar.gz cni-plugins-*.tgz cni-plugins-*.tgz.* crictl-*.tar.gz.*
+
 EOF
                         """
+                        }
                     }
                 }
             }
@@ -130,7 +157,7 @@ EOF
                         def REMOTE_DIR = "~/assignment09/${repoName}"
 
                         sh """
-ssh -o StrictHostKeyChecking=no ubuntu@${SSH_IP} << 'EOF'
+ssh -o StrictHostKeyChecking=no ubuntu@${SSH_IP} << EOF
 set -e
 cd ${REMOTE_DIR}
 
@@ -178,6 +205,12 @@ sysctl net.ipv4.ip_forward
 # Docker group membership
 groups ubuntu | grep -qw docker || echo "❌ 'ubuntu' user not in docker group"
 
+# AWS CLI version check
+aws --version
+
+# AWS identity check (verifies credentials are configured)
+aws sts get-caller-identity || echo "❌ AWS CLI is not configured correctly"
+
 echo "✅ Tool validation complete"
 EOF
                         """
@@ -186,7 +219,120 @@ EOF
             }
         }
 
+stage('Step 4: Dockerize and Push to ECR') {
+    steps {
+        sshagent (credentials: ['JL_EC2_SSH_PRIVATE_KEY']) {
+            script {
+                def SSH_IP = env.JL_AS09_EC2_IP_ADDRESS
+                def GIT_REPO = env.JL_AS09_GITHUB_REPO_URL
+                def repoName = GIT_REPO.split('/').last().replace('.git', '')
+                def REMOTE_DIR = "~/assignment09/${repoName}"
+                def MONGO_URI = env.JL_AS09_MONGO_URI_WITH_DB_NAME
+                def AWS_REGION = env.JL_AWS_REGION_ID
 
-        
+                sh """
+                ssh -o StrictHostKeyChecking=no ubuntu@${SSH_IP} << 'EOF'
+set -e
+cd ${REMOTE_DIR}
+
+echo "🧹 Removing old Docker images..."
+docker rmi -f \$(docker images -q) || true
+
+echo "📦 Creating .env files..."
+cat <<EOT > backend/helloService/.env
+PORT=3001
+EOT
+
+cat <<EOT > backend/profileService/.env
+PORT=3002
+MONGO_URL=${MONGO_URI}
+EOT
+
+cat <<EOT > frontend/.env
+REACT_APP_HELLO_BASE_URL=http://hello-service:3001
+REACT_APP_PROFILE_BASE_URL=http://profile-service:3002
+EOT
+
+echo "🐳 Creating Dockerfiles..."
+cat <<EOT > backend/helloService/Dockerfile
+FROM node:20.9.0-alpine
+WORKDIR /app
+COPY . .
+RUN npm install
+EXPOSE 3001
+CMD ["node", "index.js"]
+EOT
+
+cat <<EOT > backend/profileService/Dockerfile
+FROM node:20.9.0-alpine
+WORKDIR /app
+COPY . .
+RUN npm install
+EXPOSE 3002
+CMD ["node", "index.js"]
+EOT
+
+cat <<EOT > frontend/Dockerfile
+FROM node:20.9.0-alpine
+WORKDIR /app
+COPY . .
+RUN npm install && npm run build
+RUN npm install -g serve
+EXPOSE 3000
+CMD ["serve", "-s", "build", "-l", "3000"]
+EOT
+
+echo "⬇️ Pulling base image to avoid Docker Hub login..."
+docker pull node:20.9.0-alpine
+
+echo "🧹 Removing stale Docker Hub credentials..."
+sudo rm -f ~/.docker/config.json
+
+ACCOUNT_ID=\$(aws sts get-caller-identity --query Account --output text)
+ECR_BASE="\${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+
+for SERVICE in hello-service profile-service frontend; do
+  REPO_NAME="jl-assignment-nine-\$SERVICE"
+  IMAGE_TAG="\$REPO_NAME"
+
+  echo "📁 Ensuring ECR repository '\$REPO_NAME' exists..."
+  aws ecr describe-repositories --repository-names \$REPO_NAME || \
+  aws ecr create-repository --repository-name \$REPO_NAME
+
+  echo "🔐 Logging into ECR..."
+  aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin \$ECR_BASE
+
+  echo "📤 Building and pushing \$SERVICE image..."
+  
+  if [ "\$SERVICE" = "frontend" ]; then
+    cd frontend
+  elif [ "\$SERVICE" = "hello-service" ]; then
+    cd backend/helloService
+  elif [ "\$SERVICE" = "profile-service" ]; then
+    cd backend/profileService
+  fi
+
+  docker build -t \$IMAGE_TAG .
+  docker tag \$IMAGE_TAG \$ECR_BASE/\$REPO_NAME
+  docker push \$ECR_BASE/\$REPO_NAME
+  cd -
+done
+
+echo "✅ All images built and pushed to ECR repositories successfully."
+EOF
+                """
+            }
+        }
+    }
+}
+
+
+
+
+
+
+
+
+
     }
 }

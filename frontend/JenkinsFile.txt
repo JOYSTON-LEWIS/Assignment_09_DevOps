@@ -120,7 +120,7 @@ EOF
             }
         }
 
-        stage('Step 3: Verify Repo Folder Structure') {
+        stage('Step 3: Verify Repo Folder Structure & Validate Tools') {
             steps {
                 sshagent (credentials: ['JL_EC2_SSH_PRIVATE_KEY']) {
                     script {
@@ -130,7 +130,8 @@ EOF
                         def REMOTE_DIR = "~/assignment09/${repoName}"
 
                         sh """
-                        ssh -o StrictHostKeyChecking=no ubuntu@${SSH_IP} << EOF
+ssh -o StrictHostKeyChecking=no ubuntu@${SSH_IP} << 'EOF'
+set -e
 cd ${REMOTE_DIR}
 
 echo "📁 Verifying project structure..."
@@ -140,11 +141,52 @@ if [ ! -d "frontend" ] || [ ! -d "backend/helloService" ] || [ ! -d "backend/pro
 fi
 
 echo "✅ Folder structure is valid: frontend/, backend/helloService/, backend/profileService/"
+
+echo "🔍 Running validations for installed tools..."
+
+# Docker
+docker --version
+sudo systemctl is-active docker
+
+# Containerd
+containerd --version
+sudo systemctl is-active containerd
+
+# Kubernetes
+kubectl version --client=true --output=yaml
+minikube version
+crictl --version
+
+# CNI
+ls /opt/cni/bin | wc -l
+
+# Helm
+helm version
+
+# Python & boto3
+python3 --version
+pip3 --version
+pip3 show boto3
+
+# Kernel modules and sysctl
+lsmod | grep br_netfilter
+lsmod | grep overlay
+
+sysctl net.bridge.bridge-nf-call-iptables
+sysctl net.ipv4.ip_forward
+
+# Docker group membership
+groups ubuntu | grep -qw docker || echo "❌ 'ubuntu' user not in docker group"
+
+echo "✅ Tool validation complete"
 EOF
                         """
                     }
                 }
             }
         }
+
+
+        
     }
 }

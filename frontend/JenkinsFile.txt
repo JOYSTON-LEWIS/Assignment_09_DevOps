@@ -13,6 +13,13 @@ pipeline {
         JL_AS09_LAMBDA_ROLE_ARN         = credentials('JL_AS09_LAMBDA_ROLE_ARN')
         JL_AS09_MONGO_URI_WITH_DB_NAME  = credentials('JL_AS09_MONGO_URI_WITH_DB_NAME')
         JL_AS09_GITHUB_REPO_URL         = credentials('JL_AS09_GITHUB_REPO_URL')
+
+        // ASG Variables
+        JL_AS09_EC2_AMI_ID            = credentials('JL_AS09_EC2_AMI_ID')
+        JL_AS09_EC2_SUBNET_ID         = credentials('JL_AS09_EC2_SUBNET_ID')
+        JL_AS09_EC2_SECURITY_GROUP_ID = credentials('JL_AS09_EC2_SECURITY_GROUP_ID')
+        JL_AWS_EC2_KEY_PAIR_NAME      = credentials('JL_AWS_EC2_KEY_PAIR_NAME')
+        JL_AS09_EC2_INSTANCE_TYPE     = credentials('JL_AS09_EC2_INSTANCE_TYPE')
     }
 
     stages {
@@ -325,6 +332,103 @@ EOF
         }
     }
 }
+
+
+stage('Step 5.1: Deploy helloService via ASG') {
+    steps {
+        sshagent (credentials: ['JL_EC2_SSH_PRIVATE_KEY']) {
+            script {
+                def ip = env.JL_AS09_EC2_IP_ADDRESS
+
+                sh """
+ssh -o StrictHostKeyChecking=no ubuntu@${ip} << 'EOF'
+echo "🚀 Deploying helloService"
+
+AWS_ACCOUNT_ID=\$(aws sts get-caller-identity --query Account --output text)
+AWS_REGION=\$(aws configure get region)
+REGISTRY="\${AWS_ACCOUNT_ID}.dkr.ecr.\${AWS_REGION}.amazonaws.com"
+IMAGE="\${REGISTRY}/jl-assignment-nine-hello-service"
+
+sudo docker stop helloService || true && sudo docker rm helloService || true
+aws ecr get-login-password --region \${AWS_REGION} | sudo docker login --username AWS --password-stdin \${REGISTRY}
+sudo docker pull \${IMAGE}
+sudo docker run -d --name helloService -p 3001:3001 \${IMAGE}
+EOF
+                """
+            }
+        }
+    }
+}
+
+stage('Step 5.2: Deploy profileService via ASG') {
+    steps {
+        sshagent (credentials: ['JL_EC2_SSH_PRIVATE_KEY']) {
+            script {
+                def ip = env.JL_AS09_EC2_IP_ADDRESS
+
+                sh """
+ssh -o StrictHostKeyChecking=no ubuntu@${ip} << 'EOF'
+echo "🚀 Deploying profileService"
+
+AWS_ACCOUNT_ID=\$(aws sts get-caller-identity --query Account --output text)
+AWS_REGION=\$(aws configure get region)
+REGISTRY="\${AWS_ACCOUNT_ID}.dkr.ecr.\${AWS_REGION}.amazonaws.com"
+IMAGE="\${REGISTRY}/jl-assignment-nine-profile-service"
+
+sudo docker stop profileService || true && sudo docker rm profileService || true
+aws ecr get-login-password --region \${AWS_REGION} | sudo docker login --username AWS --password-stdin \${REGISTRY}
+sudo docker pull \${IMAGE}
+sudo docker run -d --name profileService -p 3002:3002 \${IMAGE}
+EOF
+                """
+            }
+        }
+    }
+}
+
+stage('Step 5.3: Deploy frontend via ASG') {
+    steps {
+        sshagent (credentials: ['JL_EC2_SSH_PRIVATE_KEY']) {
+            script {
+                def ip = env.JL_AS09_EC2_IP_ADDRESS
+
+                sh """
+ssh -o StrictHostKeyChecking=no ubuntu@${ip} << 'EOF'
+echo "🚀 Deploying frontend"
+
+AWS_ACCOUNT_ID=\$(aws sts get-caller-identity --query Account --output text)
+AWS_REGION=\$(aws configure get region)
+REGISTRY="\${AWS_ACCOUNT_ID}.dkr.ecr.\${AWS_REGION}.amazonaws.com"
+IMAGE="\${REGISTRY}/jl-assignment-nine-frontend"
+
+sudo docker stop frontend || true && sudo docker rm frontend || true
+aws ecr get-login-password --region \${AWS_REGION} | sudo docker login --username AWS --password-stdin \${REGISTRY}
+sudo docker pull \${IMAGE}
+sudo docker run -d --name frontend -p 3000:3000 \${IMAGE}
+EOF
+                """
+            }
+        }
+    }
+}
+
+stage('Step 5.4: Validate Endpoints') {
+    steps {
+        script {
+            def ip = env.JL_AS09_EC2_IP_ADDRESS
+
+            sh """
+echo "🔍 Validating Endpoints..."
+
+curl -s --fail http://${ip}:3001/ | grep 'Hello World' && echo '✅ helloService working' || echo '❌ helloService failed'
+
+curl -s --fail http://${ip}:3002/fetchUser | grep 'success' && echo '✅ profileService working' || echo '❌ profileService failed'
+            """
+        }
+    }
+}
+
+
 
 
 

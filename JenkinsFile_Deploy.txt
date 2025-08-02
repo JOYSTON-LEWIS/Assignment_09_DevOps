@@ -20,11 +20,313 @@ pipeline {
         JL_AS09_EC2_SECURITY_GROUP_ID = credentials('JL_AS09_EC2_SECURITY_GROUP_ID')
         JL_AWS_EC2_KEY_PAIR_NAME      = credentials('JL_AWS_EC2_KEY_PAIR_NAME')
         JL_AS09_EC2_INSTANCE_TYPE     = credentials('JL_AS09_EC2_INSTANCE_TYPE')
+
+        // Env Variables
+        JL_BACKEND_MS_01                    = 3001
+        JL_BACKEND_MS_02                    = 3002
+        JL_AS09_FRONTEND_BASE_DOMAIN_MS_01  = "hello.joydevlabs.com"
+        JL_AS09_FRONTEND_BASE_DOMAIN_MS_02  = "profile.joydevlabs.com"
     }
 
     stages {
 
-stage('Step 1.1: Deploy helloService via ASG') {
+
+        stage('Step 1: Clone GitHub Repo on EC2') {
+            steps {
+                sshagent (credentials: ['JL_EC2_SSH_PRIVATE_KEY']) {
+                    script {
+                        def SSH_IP = env.JL_AS09_EC2_IP_ADDRESS
+                        def GIT_REPO = env.JL_AS09_GITHUB_REPO_URL
+                        def repoName = GIT_REPO.split('/').last().replace('.git', '')
+
+                        sh """
+                        ssh -o StrictHostKeyChecking=no ubuntu@${SSH_IP} << EOF
+mkdir -p ~/assignment09 && cd ~/assignment09
+rm -rf ${repoName}
+git clone ${GIT_REPO}
+echo "✅ Repo cloned to ~/assignment09/${repoName}"
+EOF
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Step 2: Verify Repo Folder Structure & Validate Tools') {
+            steps {
+                sshagent (credentials: ['JL_EC2_SSH_PRIVATE_KEY']) {
+                    script {
+                        def SSH_IP = env.JL_AS09_EC2_IP_ADDRESS
+                        def GIT_REPO = env.JL_AS09_GITHUB_REPO_URL
+                        def repoName = GIT_REPO.split('/').last().replace('.git', '')
+                        def REMOTE_DIR = "~/assignment09/${repoName}"
+
+                        sh """
+ssh -o StrictHostKeyChecking=no ubuntu@${SSH_IP} << EOF
+set -e
+cd ${REMOTE_DIR}
+
+echo "📁 Verifying project structure..."
+if [ ! -d "frontend" ] || [ ! -d "backend/helloService" ] || [ ! -d "backend/profileService" ]; then
+    echo "❌ ERROR: Required folders missing!"
+    exit 1
+fi
+
+echo "✅ Folder structure is valid: frontend/, backend/helloService/, backend/profileService/"
+
+echo "🔍 Running validations for installed tools..."
+
+# Docker
+docker --version
+sudo systemctl is-active docker
+
+# Containerd
+containerd --version
+sudo systemctl is-active containerd
+
+# Kubernetes
+kubectl version --client=true --output=yaml
+minikube version
+crictl --version
+
+# CNI
+ls /opt/cni/bin | wc -l
+if [ ! -f /opt/cni/bin/bridge ]; then
+  echo "❌ CNI plugin 'bridge' missing"
+  exit 1
+fi
+
+# Helm
+helm version
+helm repo list || echo "⚠️ Helm may not be initialized"
+
+# Python & boto3
+python3 --version
+pip3 --version
+pip3 show boto3
+
+# Kernel modules and sysctl
+lsmod | grep br_netfilter
+lsmod | grep overlay
+
+sysctl net.bridge.bridge-nf-call-iptables
+sysctl net.ipv4.ip_forward
+
+# Docker group membership
+groups ubuntu | grep -qw docker || { echo "❌ 'ubuntu' user not in docker group"; exit 1; }
+
+# AWS CLI version check
+aws --version
+
+# AWS identity check (verifies credentials are configured)
+aws sts get-caller-identity || echo "❌ AWS CLI is not configured correctly"
+
+echo "✅ Tool validation complete"
+EOF
+                        """
+                    }
+                }
+            }
+        }
+
+/*
+stage('Step 3: Dockerize and Push to ECR') {
+    steps {
+        sshagent (credentials: ['JL_EC2_SSH_PRIVATE_KEY']) {
+            script {
+                def SSH_IP = env.JL_AS09_EC2_IP_ADDRESS
+                def GIT_REPO = env.JL_AS09_GITHUB_REPO_URL
+                def repoName = GIT_REPO.split('/').last().replace('.git', '')
+                def REMOTE_DIR = "~/assignment09/${repoName}"
+                def AWS_REGION = env.JL_AWS_REGION_ID
+
+                sh """
+                ssh -o StrictHostKeyChecking=no ubuntu@${SSH_IP} << 'EOF'
+set -e
+cd ${REMOTE_DIR}
+
+echo "🧹 Removing old Docker images..."
+docker rmi -f \$(docker images -q) || true
+
+echo "🐳 Creating Dockerfiles..."
+
+# helloService
+cat <<EOT > backend/helloService/Dockerfile
+FROM node:20.9.0-alpine
+WORKDIR /app
+COPY . .
+RUN npm install
+EXPOSE 3001
+CMD ["sh", "-c", "echo PORT=\\\$PORT > .env && node index.js"]
+EOT
+
+# profileService
+cat <<EOT > backend/profileService/Dockerfile
+FROM node:20.9.0-alpine
+WORKDIR /app
+COPY . .
+RUN npm install
+EXPOSE 3002
+CMD ["sh", "-c", "echo PORT=\\\$PORT > .env && echo MONGO_URL=\\\$MONGO_URL >> .env && node index.js"]
+EOT
+
+# frontend with npm start (no build)
+cat <<EOT > frontend/Dockerfile
+FROM node:20.9.0-alpine
+WORKDIR /app
+COPY . .
+RUN npm install
+EXPOSE 3000
+CMD ["sh", "-c", "echo REACT_APP_HELLO_BASE_URL=\\\$REACT_APP_HELLO_BASE_URL > .env && echo REACT_APP_PROFILE_BASE_URL=\\\$REACT_APP_PROFILE_BASE_URL >> .env && npm start"]
+EOT
+
+echo "⬇️ Pulling base image..."
+docker pull node:20.9.0-alpine
+
+echo "🧹 Removing stale Docker credentials..."
+rm -f ~/.docker/config.json || true
+
+ACCOUNT_ID=\$(aws sts get-caller-identity --query Account --output text)
+ECR_BASE="\${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+
+for SERVICE in hello-service profile-service frontend; do
+  REPO_NAME="jl-assignment-nine-\$SERVICE"
+  IMAGE_TAG="\$REPO_NAME"
+
+  echo "📁 Checking/creating ECR repo: \$REPO_NAME"
+  aws ecr describe-repositories --repository-names \$REPO_NAME || \
+  aws ecr create-repository --repository-name \$REPO_NAME
+
+  echo "🔐 Logging into ECR..."
+  aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin \$ECR_BASE
+
+  echo "📤 Building and pushing: \$SERVICE"
+
+  if [ "\$SERVICE" = "frontend" ]; then
+    cd frontend
+  elif [ "\$SERVICE" = "hello-service" ]; then
+    cd backend/helloService
+  elif [ "\$SERVICE" = "profile-service" ]; then
+    cd backend/profileService
+  fi
+
+  docker build -t \$IMAGE_TAG .
+  docker tag \$IMAGE_TAG \$ECR_BASE/\$REPO_NAME
+  docker push \$ECR_BASE/\$REPO_NAME
+  cd - > /dev/null
+done
+
+echo "✅ All images built and pushed to ECR successfully."
+EOF
+                """
+            }
+        }
+    }
+}
+*/
+
+
+/*
+stage('Step 4: Deploy helloService via ASG') {
+  steps {
+    withCredentials([
+      string(credentialsId: 'JL_AWS_REGION_ID', variable: 'JL_AWS_REGION_ID'),
+      string(credentialsId: 'JL_AS09_EC2_AMI_ID', variable: 'JL_AS09_EC2_AMI_ID'),
+      string(credentialsId: 'JL_AS09_EC2_INSTANCE_TYPE', variable: 'JL_AS09_EC2_INSTANCE_TYPE'),
+      string(credentialsId: 'JL_AS09_EC2_SUBNET_ID', variable: 'JL_AS09_EC2_SUBNET_ID'),
+      string(credentialsId: 'JL_AS09_EC2_SECURITY_GROUP_ID', variable: 'JL_AS09_EC2_SECURITY_GROUP_ID'),
+      string(credentialsId: 'JL_AWS_EC2_KEY_PAIR_NAME', variable: 'JL_AWS_EC2_KEY_PAIR_NAME'),
+      string(credentialsId: 'JL_AWS_EC2_KEY_PAIR_NAME', variable: 'JL_AWS_EC2_KEY_PAIR_NAME')
+    ]) {
+      sh '''
+        echo "🚀 Creating Launch Template & ASG for helloService..."
+
+        cat <<EOF > create_hello_asg.py
+import boto3
+import time
+import base64
+import os
+
+region = os.environ['JL_AWS_REGION_ID']
+ami_id = os.environ['JL_AS09_EC2_AMI_ID']
+instance_type = os.environ['JL_AS09_EC2_INSTANCE_TYPE']
+subnet_id = os.environ['JL_AS09_EC2_SUBNET_ID']
+security_group_id = os.environ['JL_AS09_EC2_SECURITY_GROUP_ID']
+key_pair = os.environ['JL_AWS_EC2_KEY_PAIR_NAME']
+
+ec2 = boto3.client('ec2', region_name=region)
+autoscaling = boto3.client('autoscaling', region_name=region)
+
+aws_account_id = boto3.client('sts').get_caller_identity()['Account']
+ecr_uri = f"{aws_account_id}.dkr.ecr.{region}.amazonaws.com/jl-assignment-nine-hello-service"
+
+user_data_script = f"""#!/bin/bash
+sudo apt update -y
+sudo apt install -y docker.io
+sudo systemctl start docker
+sudo systemctl enable docker
+
+aws ecr get-login-password --region {region} | docker login --username AWS --password-stdin {aws_account_id}.dkr.ecr.{region}.amazonaws.com
+
+docker pull {ecr_uri}
+docker run -d --name helloService -p 3001:3001 -e PORT=3001 {ecr_uri}
+"""
+
+encoded_user_data = base64.b64encode(user_data_script.encode()).decode()
+
+lt_name = 'JL-Assignment9-helloService-LT'
+asg_name = 'JL-Assignment9-helloService-ASG'
+
+print(f"✅ Creating Launch Template: {lt_name}")
+lt = ec2.create_launch_template(
+    LaunchTemplateName=lt_name,
+    LaunchTemplateData={
+        'ImageId': ami_id,
+        'InstanceType': instance_type,
+        'KeyName': key_pair,
+        'SecurityGroupIds': [security_group_id],
+        'UserData': encoded_user_data
+    }
+)
+
+lt_id = lt['LaunchTemplate']['LaunchTemplateId']
+
+print(f"✅ Creating Auto Scaling Group: {asg_name}")
+autoscaling.create_auto_scaling_group(
+    AutoScalingGroupName=asg_name,
+    LaunchTemplate={
+        'LaunchTemplateId': lt_id,
+        'Version': '$Latest'
+    },
+    MinSize=1,
+    MaxSize=1,
+    DesiredCapacity=1,
+    VPCZoneIdentifier=subnet_id,
+    Tags=[
+        {
+            'ResourceId': asg_name,
+            'ResourceType': 'auto-scaling-group',
+            'Key': 'Name',
+            'Value': 'JL-helloService-instance',
+            'PropagateAtLaunch': True
+        }
+    ]
+)
+
+print("🎉 ASG and Launch Template for helloService created successfully.")
+EOF
+
+        python3 create_hello_asg.py
+      '''
+    }
+  }
+}
+*/
+
+
+
+/*
+stage('Step 4.1: Deploy helloService via ASG') {
     steps {
         sshagent (credentials: ['JL_EC2_SSH_PRIVATE_KEY']) {
             script {
@@ -50,7 +352,7 @@ EOF
     }
 }
 
-stage('Step 1.2: Deploy profileService via ASG') {
+stage('Step 4.2: Deploy profileService via ASG') {
     steps {
         sshagent (credentials: ['JL_EC2_SSH_PRIVATE_KEY']) {
             script {
@@ -76,7 +378,7 @@ EOF
     }
 }
 
-stage('Step 1.3: Deploy frontend via ASG') {
+stage('Step 4.3: Deploy frontend via ASG') {
     steps {
         sshagent (credentials: ['JL_EC2_SSH_PRIVATE_KEY']) {
             script {
@@ -102,7 +404,7 @@ EOF
     }
 }
 
-stage('Step 1.4: Validate Endpoints') {
+stage('Step 4.4: Validate Endpoints') {
     steps {
         script {
             def ip = env.JL_AS09_EC2_IP_ADDRESS
@@ -118,11 +420,7 @@ curl -s --fail http://${ip}:3002/fetchUser | grep 'success' && echo '✅ profile
     }
 }
 
-
-
-
-
-
+*/
 
 
 

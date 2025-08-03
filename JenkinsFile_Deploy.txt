@@ -26,6 +26,11 @@ pipeline {
         JL_BACKEND_MS_02                    = 3002
         JL_AS09_FRONTEND_BASE_DOMAIN_MS_01  = "hello.joydevlabs.com"
         JL_AS09_FRONTEND_BASE_DOMAIN_MS_02  = "profile.joydevlabs.com"
+
+        JL_S3_BUCKET_NAME                   = "jl-joyston-assignment-nine-bucket"
+        JL_MONGO_BACKUP_IMAGE_REPO_NAME     = "jl-assignment-nine-mongo-atlas-backup-image"
+        JL_MONGO_BACKUP_LAMBDA_NAME         = "jl-assignment-nine-mongo-backup-fn"
+        JL_PROFILE_SERVICE_DB_NAME          = "assignment_nine"
     }
 
     stages {
@@ -129,7 +134,493 @@ EOF
             }
         }
 
+
+stage('Step 3: Dockerize and Push to ECR') {
+    steps {
+        sshagent (credentials: ['JL_EC2_SSH_PRIVATE_KEY']) {
+            script {
+                def SSH_IP = env.JL_AS09_EC2_IP_ADDRESS
+                def GIT_REPO = env.JL_AS09_GITHUB_REPO_URL
+                def repoName = GIT_REPO.split('/').last().replace('.git', '')
+                def REMOTE_DIR = "~/assignment09/${repoName}"
+                def AWS_REGION = env.JL_AWS_REGION_ID
+
+                sh """
+                ssh -o StrictHostKeyChecking=no ubuntu@${SSH_IP} << 'EOF'
+set -e
+cd ${REMOTE_DIR}
+
+echo "🧹 Removing old Docker images..."
+docker rmi -f \$(docker images -q) || true
+
+echo "🐳 Creating Dockerfiles..."
+
+# helloService
+cat <<'EOT' > backend/helloService/Dockerfile
+FROM node:20.9.0-alpine
+WORKDIR /app
+COPY . .
+RUN npm install
+EXPOSE 3001
+CMD ["node", "index.js"]
+EOT
+
+# profileService
+cat <<'EOT' > backend/profileService/Dockerfile
+FROM node:20.9.0-alpine
+WORKDIR /app
+COPY . .
+RUN npm install
+EXPOSE 3002
+CMD ["node", "index.js"]
+EOT
+
+# frontend
+cat <<'EOT' > frontend/Dockerfile
+FROM node:20.9.0-alpine
+WORKDIR /app
+COPY . .
+RUN npm install
+EXPOSE 3000
+CMD ["npm", "start"]
+EOT
+
+echo "⬇️ Pulling base image..."
+docker pull node:20.9.0-alpine
+
+echo "🧹 Removing stale Docker credentials..."
+rm -f ~/.docker/config.json || true
+
+ACCOUNT_ID=\$(aws sts get-caller-identity --query Account --output text)
+ECR_BASE="\${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+
+for SERVICE in hello-service profile-service frontend; do
+  REPO_NAME="jl-assignment-nine-\$SERVICE"
+  IMAGE_TAG="\$REPO_NAME"
+
+  echo "📁 Checking/creating ECR repo: \$REPO_NAME"
+  aws ecr describe-repositories --repository-names \$REPO_NAME || \
+  aws ecr create-repository --repository-name \$REPO_NAME
+
+  echo "🔐 Logging into ECR..."
+  aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin \$ECR_BASE
+
+  echo "📤 Building and pushing: \$SERVICE"
+
+  if [ "\$SERVICE" = "frontend" ]; then
+    cd frontend
+  elif [ "\$SERVICE" = "hello-service" ]; then
+    cd backend/helloService
+  elif [ "\$SERVICE" = "profile-service" ]; then
+    cd backend/profileService
+  fi
+
+  docker build -t \$IMAGE_TAG .
+  docker tag \$IMAGE_TAG \$ECR_BASE/\$REPO_NAME
+  docker push \$ECR_BASE/\$REPO_NAME
+  cd - > /dev/null
+done
+
+echo "✅ All images built and pushed to ECR successfully."
+EOF
+                """
+            }
+        }
+    }
+}
+
+
+stage('Step 10.1: Generate Lambda Docker Files') {
+  steps {
+    sshagent (credentials: ['JL_EC2_SSH_PRIVATE_KEY']) {
+      sh '''
+        ssh -o StrictHostKeyChecking=no ubuntu@$JL_AS09_EC2_IP_ADDRESS << 'EOF'
+echo "✅ Connected to EC2"
+
+rm -rf mongo_lambda_backup
+
+mkdir -p ~/mongo_lambda_backup && cd ~/mongo_lambda_backup
+
+cat > lambda_function.py << 'PYEOF'
+import os
+import subprocess
+import datetime
+import boto3
+
+def lambda_handler(event, context=None):
+    mongo_uri = event.get("MONGO_URI")
+    s3_bucket = event.get("S3_BUCKET")
+    db_name = event.get("DB_NAME")
+    region = event.get("REGION")
+    aws_access_key = event.get("AWS_ACCESS_KEY_ID")
+    aws_secret_key = event.get("AWS_SECRET_ACCESS_KEY")
+
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    filename = f"mongodb_backup_{timestamp}.gz"
+    s3_key = f"mongodb_backups/{filename}"
+
+    os.environ["AWS_ACCESS_KEY_ID"] = aws_access_key
+    os.environ["AWS_SECRET_ACCESS_KEY"] = aws_secret_key
+    os.environ["AWS_DEFAULT_REGION"] = region
+
+    dump_cmd = f"mongodump --uri=\\"{mongo_uri}\\" --archive={filename} --gzip"
+    subprocess.run(dump_cmd, shell=True, check=True)
+
+    s3 = boto3.client("s3", region_name=region)
+    with open(filename, "rb") as f:
+        s3.upload_fileobj(f, s3_bucket, s3_key)
+
+    print(f"✅ Backup uploaded to S3: {s3_key}")
+    return {"status": "success", "s3_key": s3_key}
+PYEOF
+
+cat > Dockerfile << 'DOCKER'
+FROM public.ecr.aws/lambda/python:3.11-slim
+
+RUN pip install boto3 pymongo
+
+COPY lambda_function.py ./
+
+CMD [ "lambda_function.lambda_handler" ]
+DOCKER
+
+echo "✅ Files created"
+EOF
+      '''
+    }
+  }
+}
+
+
+stage('Step 10.2: Ensure Mongo Backup ECR Repo Exists') {
+    steps {
+        script {
+            withCredentials([[
+                $class: 'AmazonWebServicesCredentialsBinding',
+                credentialsId: 'JL_AWS_CREDENTIALS',
+                accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+            ]]) {
+                withEnv([
+                    "JL_MONGO_BACKUP_IMAGE_REPO_NAME=${env.JL_MONGO_BACKUP_IMAGE_REPO_NAME}",
+                    "JL_AWS_REGION=${env.JL_AWS_REGION_ID}"
+                ]) {
+                    sh '''
+                    echo "🔍 Checking if ECR repo exists..."
+                    if ! aws ecr describe-repositories --region "$JL_AWS_REGION" --repository-names "$JL_MONGO_BACKUP_IMAGE_REPO_NAME" > /dev/null 2>&1; then
+                        echo "📦 Creating ECR repo: $JL_MONGO_BACKUP_IMAGE_REPO_NAME"
+                        aws ecr create-repository --repository-name "$JL_MONGO_BACKUP_IMAGE_REPO_NAME" --region "$JL_AWS_REGION"
+                    else
+                        echo "✅ ECR repo already exists: $JL_MONGO_BACKUP_IMAGE_REPO_NAME"
+                    fi
+                    '''
+                }
+            }
+        }
+    }
+}
+
+
+
+
+stage('Step 10.3: Build and Push Mongo Backup Docker Image') {
+    steps {
+        script {
+            withCredentials([[ 
+                $class: 'AmazonWebServicesCredentialsBinding',
+                credentialsId: 'JL_AWS_CREDENTIALS',
+                accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+            ]]) {
+                withEnv([
+                    "JL_MONGO_BACKUP_IMAGE_REPO_NAME=${env.JL_MONGO_BACKUP_IMAGE_REPO_NAME}",
+                    "JL_AWS_REGION=${env.JL_AWS_REGION_ID}"
+                ]) {
+                    sh '''                    
+                    export DOCKER_BUILDKIT=0
+
+                    echo "📄 Writing Dockerfile..."
+cat > Dockerfile <<EOF
+FROM public.ecr.aws/docker/library/python:3.11-slim
+
+RUN apt-get update && \
+    apt-get install -y gnupg curl && \
+    curl -fsSL https://pgp.mongodb.com/server-6.0.asc | gpg --dearmor -o /usr/share/keyrings/mongodb-server-6.0.gpg && \
+    echo "deb [ signed-by=/usr/share/keyrings/mongodb-server-6.0.gpg ] https://repo.mongodb.org/apt/debian bullseye/mongodb-org/6.0 main" | tee /etc/apt/sources.list.d/mongodb-org-6.0.list && \
+    apt-get update && \
+    apt-get install -y mongodb-database-tools && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir pymongo boto3
+
+COPY backup_script.py /app/backup_script.py
+
+CMD ["python", "/app/backup_script.py"]
+EOF
+
+                    echo "📄 Writing backup_script.py..."
+cat > backup_script.py <<EOF
+import os, boto3, subprocess, datetime
+
+mongo_uri = os.getenv("MONGO_URI")
+s3_bucket = os.getenv("S3_BUCKET")
+backup_prefix = os.getenv("S3_PREFIX", "mongodb_backups")
+
+timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+archive_name = f"backup_{timestamp}.gz"
+
+subprocess.run([
+    "mongodump",
+    f"--uri={mongo_uri}",
+    "--archive=" + archive_name,
+    "--gzip"
+], check=True)
+
+s3 = boto3.client("s3")
+s3.upload_file(archive_name, s3_bucket, f"{backup_prefix}/{archive_name}")
+print("✅ Backup uploaded to S3 as", f"{backup_prefix}/{archive_name}")
+EOF
+
+                    echo "🛠️ Building MongoDB backup Docker image..."
+                    docker build -t $JL_MONGO_BACKUP_IMAGE_REPO_NAME .
+
+                    echo "🔑 Logging into ECR..."
+                    aws ecr get-login-password --region "$JL_AWS_REGION" | docker login --username AWS --password-stdin 975050024946.dkr.ecr."$JL_AWS_REGION".amazonaws.com
+
+                    echo "📤 Tagging and pushing to ECR..."
+                    docker tag $JL_MONGO_BACKUP_IMAGE_REPO_NAME:latest 975050024946.dkr.ecr.$JL_AWS_REGION.amazonaws.com/$JL_MONGO_BACKUP_IMAGE_REPO_NAME:latest
+                    docker push 975050024946.dkr.ecr.$JL_AWS_REGION.amazonaws.com/$JL_MONGO_BACKUP_IMAGE_REPO_NAME:latest
+                    '''
+                }
+            }
+        }
+    }
+}
+
+
+
+stage('Step 10.4: Deploy MongoDB Backup Lambda Function') {
+    steps {
+        script {
+            withCredentials([[ 
+                $class: 'AmazonWebServicesCredentialsBinding', 
+                credentialsId: 'JL_AWS_CREDENTIALS', 
+                accessKeyVariable: 'AWS_ACCESS_KEY_ID', 
+                secretKeyVariable: 'AWS_SECRET_ACCESS_KEY' 
+            ]]) {
+                withEnv([
+                    "JL_AWS_REGION=${env.JL_AWS_REGION_ID}",
+                    "JL_MONGO_BACKUP_LAMBDA_NAME=${env.JL_MONGO_BACKUP_LAMBDA_NAME}",
+                    "JL_MONGO_BACKUP_IMAGE_REPO_NAME=${env.JL_MONGO_BACKUP_IMAGE_REPO_NAME}",
+                    "JL_MONGO_ATLAS_URI=${env.JL_MONGO_ATLAS_URI}",
+                    "JL_PROFILE_SERVICE_DB_NAME=${env.JL_PROFILE_SERVICE_DB_NAME}",
+                    "JL_S3_BUCKET_NAME=${env.JL_S3_BUCKET_NAME}"
+                ]) {
+                    sh '''
+                    echo "🚀 Creating/Updating Lambda Function..."
+
+                    ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text --region "$JL_AWS_REGION")
+                    echo "🔍 Using AWS Account ID: $ACCOUNT_ID"
+
+                    echo "🔗 Checking if Lambda function exists..."
+                    if aws lambda get-function --function-name "$JL_MONGO_BACKUP_LAMBDA_NAME" --region "$JL_AWS_REGION" > /dev/null 2>&1; then
+                        echo "🔁 Updating existing Lambda..."
+                        aws lambda update-function-code \
+                          --function-name "$JL_MONGO_BACKUP_LAMBDA_NAME" \
+                          --image-uri "$ACCOUNT_ID.dkr.ecr.$JL_AWS_REGION.amazonaws.com/$JL_MONGO_BACKUP_IMAGE_REPO_NAME:latest" \
+                          --region "$JL_AWS_REGION"
+                    else
+                        echo "🆕 Creating new Lambda..."
+
+                        ROLE_NAME="${JL_MONGO_BACKUP_LAMBDA_NAME}-execution-role"
+
+                        echo "📜 Creating trust policy..."
+                        TRUST_FILE=trust-policy.json
+                        cat > $TRUST_FILE <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "lambda.amazonaws.com"
+      },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}
+EOF
+
+                        echo "🛡️ Creating IAM role (if not exists)..."
+                        if ! aws iam get-role --role-name "$ROLE_NAME" --region "$JL_AWS_REGION" > /dev/null 2>&1; then
+                          aws iam create-role \
+                            --role-name "$ROLE_NAME" \
+                            --assume-role-policy-document file://$TRUST_FILE \
+                            --region "$JL_AWS_REGION"
+
+                          echo "🔐 Attaching basic execution policy..."
+                          aws iam attach-role-policy \
+                            --role-name "$ROLE_NAME" \
+                            --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole \
+                            --region "$JL_AWS_REGION"
+
+                          echo "🕐 Waiting for IAM role propagation..."
+                          sleep 10
+                        else
+                          echo "ℹ️ Role already exists. Skipping creation."
+                        fi
+
+                        echo "🚀 Creating Lambda with ECR image..."
+                        aws lambda create-function \
+                          --function-name "$JL_MONGO_BACKUP_LAMBDA_NAME" \
+                          --package-type Image \
+                          --code ImageUri="$ACCOUNT_ID.dkr.ecr.$JL_AWS_REGION.amazonaws.com/$JL_MONGO_BACKUP_IMAGE_REPO_NAME:latest" \
+                          --role "arn:aws:iam::$ACCOUNT_ID:role/$ROLE_NAME" \
+                          --timeout 900 \
+                          --memory-size 1024 \
+                          --region "$JL_AWS_REGION" \
+                          --environment Variables="{\"MONGO_URI\":\"$JL_MONGO_ATLAS_URI\",\"S3_BUCKET\":\"$JL_S3_BUCKET_NAME\",\"S3_PREFIX\":\"mongodb_backups\"}"
+
+                        echo "✅ Lambda function '$JL_MONGO_BACKUP_LAMBDA_NAME' created successfully."
+                    fi
+
+                    echo "🧪 Invoking Lambda function to test backup..."
+                    aws lambda invoke \
+                      --function-name "$JL_MONGO_BACKUP_LAMBDA_NAME" \
+                      --region "$JL_AWS_REGION" \
+                      /tmp/mongo-backup-output.json
+
+                    echo "📄 Lambda output:"
+                    cat /tmp/mongo-backup-output.json
+                    '''
+                }
+            }
+        }
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
 /*
+
+stage('Step 6.1: Deploy Backend EC2s in ASG') {
+            steps {
+                sshagent (credentials: ['JL_EC2_SSH_PRIVATE_KEY']) {
+                    script {
+                        sh """
+                        ssh -o StrictHostKeyChecking=no ubuntu@${SSH_IP} << 'EOF'
+                        set -e
+                        echo "🚀 Creating Launch Template"
+                        aws ec2 create-launch-template \
+                        --launch-template-name JL-Assignment-Nine-LaunchTemplate \
+                        --version-description "v1" \
+                        --launch-template-data ' {
+                            "ImageId": "${JL_AS09_EC2_AMI_ID}",
+                            "InstanceType": "${JL_AS09_EC2_INSTANCE_TYPE}",
+                            "KeyName": "${JL_AWS_EC2_KEY_PAIR_NAME}",
+                            "SecurityGroupIds": ["${JL_AS09_EC2_SECURITY_GROUP_ID}"],
+                            "UserData": "$(echo -n '#!/bin/bash\n\n# Install Docker\napt update -y && apt install -y docker.io\nsystemctl start docker && systemctl enable docker\n\n# Fetch AWS Account ID\nAWS_REGION=${AWS_DEFAULT_REGION}\nAWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)\nREGISTRY=${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com\n\n# Authenticate with ECR\naws ecr get-login-password --region ${AWS_DEFAULT_REGION} | docker login --username AWS --password-stdin ${REGISTRY}\n\n# Run helloService\ndocker pull ${REGISTRY}/jl-assignment-nine-hello-service\ndocker run -d --name helloService -p 3001:3001 \\\n  -e PORT=3001 \\\n  ${REGISTRY}/jl-assignment-nine-hello-service\n\n# Run profileService\ndocker pull ${REGISTRY}/jl-assignment-nine-profile-service\ndocker run -d --name profileService -p 3002:3002 \\\n  -e PORT=3002 \\\n  -e MONGO_URL=mongodb://localhost:27017/profiledb \\\n  ${REGISTRY}/jl-assignment-nine-profile-service' | base64)"
+                        }'
+
+                        echo "🛠️ Creating Auto Scaling Group"
+                        aws autoscaling create-auto-scaling-group \
+                        --auto-scaling-group-name JL-Assignment-Nine-ASG \
+                        --launch-template LaunchTemplateName=JL-Assignment-Nine-LaunchTemplate,Version=1 \
+                        --min-size 2 --max-size 2 --desired-capacity 2 \
+                        --vpc-zone-identifier "${JL_AS09_EC2_SUBNET_ID}"
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Step 7.1: Create ALB and Register Target Group') {
+            steps {
+                sshagent (credentials: ['JL_EC2_SSH_PRIVATE_KEY']) {
+                    script {
+                        sh """
+                        ssh -o StrictHostKeyChecking=no ubuntu@${SSH_IP} << 'EOF'
+                        set -e
+                        echo "🌐 Creating Target Group"
+                        TG_ARN=$(aws elbv2 create-target-group \
+                            --name jl-backend-tg \
+                            --protocol HTTP \
+                            --port 3001 \
+                            --vpc-id $(aws ec2 describe-subnets --subnet-ids ${JL_AS09_EC2_SUBNET_ID} --query 'Subnets[0].VpcId' --output text) \
+                            --target-type instance \
+                            --query 'TargetGroups[0].TargetGroupArn' --output text)
+
+                        echo "🚀 Creating ALB"
+                        ALB_ARN=$(aws elbv2 create-load-balancer \
+                            --name jl-backend-alb \
+                            --subnets ${JL_AS09_EC2_SUBNET_ID} \
+                            --security-groups ${JL_AS09_EC2_SECURITY_GROUP_ID} \
+                            --query 'LoadBalancers[0].LoadBalancerArn' --output text)
+
+                        echo "🧠 Creating Listener"
+                        aws elbv2 create-listener \
+                            --load-balancer-arn $ALB_ARN \
+                            --protocol HTTP \
+                            --port 80 \
+                            --default-actions Type=forward,TargetGroupArn=$TG_ARN
+
+                        echo "⏳ Waiting for instances to attach"
+                        sleep 60
+
+                        echo "📦 Registering instances to target group"
+                        INSTANCE_IDS=$(aws autoscaling describe-auto-scaling-groups --auto-scaling-group-name JL-Assignment-Nine-ASG \
+                            --query 'AutoScalingGroups[0].Instances[*].InstanceId' --output text)
+
+                        for ID in $INSTANCE_IDS; do
+                        aws elbv2 register-targets --target-group-arn $TG_ARN --targets Id=$ID,Port=3001
+                        done
+
+                        echo "🌐 Getting ALB DNS"
+                        aws elbv2 describe-load-balancers --names jl-backend-alb --query 'LoadBalancers[0].DNSName' --output text
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Step 9: Cleanup (Optional)') {
+            steps {
+                sshagent (credentials: ['JL_EC2_SSH_PRIVATE_KEY']) {
+                    script {
+                        sh """
+                        ssh -o StrictHostKeyChecking=no ubuntu@${SSH_IP} << 'EOF'
+                        set -e
+                        echo "🧹 Deleting Auto Scaling Group"
+                        aws autoscaling delete-auto-scaling-group \
+                            --auto-scaling-group-name JL-Assignment-Nine-ASG --force-delete
+
+                        echo "🧹 Deleting Launch Template"
+                        aws ec2 delete-launch-template \
+                            --launch-template-name JL-Assignment-Nine-LaunchTemplate
+
+                        echo "🧹 Deleting Target Group"
+                        TG_ARN=$(aws elbv2 describe-target-groups --names jl-backend-tg --query 'TargetGroups[0].TargetGroupArn' --output text)
+                        aws elbv2 delete-target-group --target-group-arn $TG_ARN
+
+                        echo "🧹 Deleting Load Balancer"
+                        ALB_ARN=$(aws elbv2 describe-load-balancers --names jl-backend-alb --query 'LoadBalancers[0].LoadBalancerArn' --output text)
+                        aws elbv2 delete-load-balancer --load-balancer-arn $ALB_ARN
+                        """
+                    }
+                }
+            }
+        }
+
+
+
 stage('Step 3: Dockerize and Push to ECR') {
     steps {
         sshagent (credentials: ['JL_EC2_SSH_PRIVATE_KEY']) {
@@ -223,10 +714,7 @@ EOF
         }
     }
 }
-*/
 
-
-/*
 stage('Step 4: Deploy helloService via ASG') {
   steps {
     withCredentials([

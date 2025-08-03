@@ -26,6 +26,11 @@ pipeline {
         JL_BACKEND_MS_02                    = 3002
         JL_AS09_FRONTEND_BASE_DOMAIN_MS_01  = "hello.joydevlabs.com"
         JL_AS09_FRONTEND_BASE_DOMAIN_MS_02  = "profile.joydevlabs.com"
+
+        JL_S3_BUCKET_NAME                   = "jl-joyston-assignment-nine-bucket"
+        JL_MONGO_BACKUP_IMAGE_REPO_NAME     = "jl-assignment-nine-mongo-atlas-backup-image"
+        JL_MONGO_BACKUP_LAMBDA_NAME         = "jl-assignment-nine-mongo-backup-fn"
+        JL_PROFILE_SERVICE_DB_NAME          = "assignment_nine" 
     }
 
     stages {

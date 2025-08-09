@@ -151,9 +151,435 @@ EOF
         }
 
 
+stage('Step 2.1: Generate Lambda Docker Files') {
+    steps {
+    sshagent (credentials: ['JL_EC2_SSH_PRIVATE_KEY']) {
+                    sh '''
+        ssh -o StrictHostKeyChecking=no ubuntu@$JL_AS09_EC2_IP_ADDRESS << 'EOF'
+echo "✅ Connected to EC2"
+
+                    rm -rf mongo_lambda_backup
+
+mkdir -p ~/mongo_lambda_backup && cd ~/mongo_lambda_backup
+
+cat > lambda_function.py << 'PYEOF'
+import os
+import subprocess
+import datetime
+import boto3
+
+def lambda_handler(event, context=None):
+    mongo_uri = event.get("MONGO_URI")
+    s3_bucket = event.get("S3_BUCKET")
+    region = event.get("REGION")
+    aws_access_key = event.get("AWS_ACCESS_KEY_ID")
+    aws_secret_key = event.get("AWS_SECRET_ACCESS_KEY")
+
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    filename = f"mongodb_backup_{timestamp}.gz"
+    s3_key = f"mongodb_backups/{filename}"
+
+    os.environ["AWS_ACCESS_KEY_ID"] = aws_access_key
+    os.environ["AWS_SECRET_ACCESS_KEY"] = aws_secret_key
+    os.environ["AWS_DEFAULT_REGION"] = region
+
+    dump_cmd = f"mongodump --uri=\\"{mongo_uri}\\" --archive={filename} --gzip"
+    subprocess.run(dump_cmd, shell=True, check=True)
+
+    s3 = boto3.client("s3", region_name=region)
+    with open(filename, "rb") as f:
+        s3.upload_fileobj(f, s3_bucket, s3_key)
+
+    print(f"✅ Backup uploaded to S3: {s3_key}")
+    return {"status": "success", "s3_key": s3_key}
+PYEOF
+
+cat > Dockerfile << 'DOCKER'
+FROM public.ecr.aws/lambda/python:3.12
+
+RUN pip install boto3 pymongo
+
+COPY lambda_function.py ./
+
+CMD [ "lambda_function.lambda_handler" ]
+DOCKER
+
+echo "✅ Files created"
+EOF
+                    '''
+                }
+    }
+}
 
 
+stage('Step 2.2: Ensure Mongo Backup ECR Repo Exists') {
+    steps {
+        script {
+            withCredentials([[
+                $class: 'AmazonWebServicesCredentialsBinding',
+                credentialsId: 'JL_AWS_CREDENTIALS',
+                accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+            ]]) {
+                withEnv([
+                    "JL_MONGO_BACKUP_IMAGE_REPO_NAME=${env.JL_MONGO_BACKUP_IMAGE_REPO_NAME}",
+                    "JL_AWS_REGION=${env.JL_AWS_REGION_ID}"
+                ]) {
+                    sh '''
+                    echo "🔍 Checking if ECR repo exists..."
+                    if ! aws ecr describe-repositories --region "$JL_AWS_REGION" --repository-names "$JL_MONGO_BACKUP_IMAGE_REPO_NAME" > /dev/null 2>&1; then
+                        echo "📦 Creating ECR repo: $JL_MONGO_BACKUP_IMAGE_REPO_NAME"
+                        aws ecr create-repository --repository-name "$JL_MONGO_BACKUP_IMAGE_REPO_NAME" --region "$JL_AWS_REGION"
+                    else
+                        echo "✅ ECR repo already exists: $JL_MONGO_BACKUP_IMAGE_REPO_NAME"
+                    fi
+                    '''
+                }
+            }
+        }
+    }
+}
 
+stage('2.3: Build and Push Mongo Backup Docker Image') {
+    steps {
+        script {
+            withCredentials([[ 
+                $class: 'AmazonWebServicesCredentialsBinding',
+                credentialsId: 'JL_AWS_CREDENTIALS',
+                accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+            ]]) {
+                withEnv([
+                    "JL_MONGO_BACKUP_IMAGE_REPO_NAME=${env.JL_MONGO_BACKUP_IMAGE_REPO_NAME}",
+                    "JL_AWS_REGION=${env.JL_AWS_REGION_ID}"
+                ]) {
+                    sh '''                    
+                    export DOCKER_BUILDKIT=0
+
+                    echo "📄 Writing Dockerfile..."
+cat > Dockerfile <<EOF
+FROM debian:bullseye-slim as builder
+
+RUN apt-get update && apt-get install -y gnupg curl
+
+RUN curl -fsSL https://pgp.mongodb.com/server-6.0.asc | gpg --dearmor -o /usr/share/keyrings/mongodb-server-6.0.gpg
+
+RUN echo "deb [signed-by=/usr/share/keyrings/mongodb-server-6.0.gpg] https://repo.mongodb.org/apt/debian bullseye/mongodb-org/6.0 main" > /etc/apt/sources.list.d/mongodb-org-6.0.list
+
+RUN apt-get update && apt-get install -y mongodb-database-tools
+
+FROM public.ecr.aws/lambda/python:3.12
+
+COPY --from=builder /usr/bin/mongodump /usr/bin/mongodump
+
+RUN pip install --no-cache-dir pymongo boto3
+
+WORKDIR /var/task
+
+COPY backup_script.py .
+
+CMD ["backup_script.lambda_handler"]
+EOF
+
+                    echo "📄 Writing backup_script.py..."
+cat > backup_script.py << 'EOF'
+import os, boto3, subprocess, datetime, sys
+
+mongo_uri = os.getenv("MONGO_URI")
+s3_bucket = os.getenv("S3_BUCKET")
+backup_prefix = os.getenv("S3_PREFIX", "mongodb_backups")
+
+def run_backup():
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    # Write dump to /tmp folder (writable in Lambda)
+    archive_name = f"/tmp/backup_{timestamp}.gz"
+
+    print("Current working dir:", os.getcwd())
+    print("Archive path:", archive_name)
+
+    subprocess.run([
+        "mongodump",
+        f"--uri={mongo_uri}",
+        "--archive=" + archive_name,
+        "--gzip"
+    ], check=True)
+
+    s3 = boto3.client("s3")
+    s3.upload_file(archive_name, s3_bucket, f"{backup_prefix}/{os.path.basename(archive_name)}")
+    print("Backup uploaded to S3 as", f"{backup_prefix}/{os.path.basename(archive_name)}")
+
+def lambda_handler(event, context):
+    try:
+        run_backup()
+        return {"status": "success"}
+    except Exception as e:
+        print("Backup failed:", e)
+        return {"status": "error", "message": str(e)}
+
+# if __name__ == "__main__":
+    # For local debugging, exit with status 0 on success
+    # try:
+        # run_backup()
+        # sys.exit(0)
+    # except Exception as e:
+        # print("Backup failed:", e)
+        # sys.exit(1)
+EOF
+
+                    echo "🛠️ Building MongoDB backup Docker image..."
+                    docker build -t $JL_MONGO_BACKUP_IMAGE_REPO_NAME .
+
+                    echo "🔑 Logging into ECR..."
+                    aws ecr get-login-password --region "$JL_AWS_REGION" | docker login --username AWS --password-stdin 975050024946.dkr.ecr."$JL_AWS_REGION".amazonaws.com
+
+                    echo "📤 Tagging and pushing to ECR..."
+                    docker tag $JL_MONGO_BACKUP_IMAGE_REPO_NAME:latest 975050024946.dkr.ecr.$JL_AWS_REGION.amazonaws.com/$JL_MONGO_BACKUP_IMAGE_REPO_NAME:latest
+                    docker push 975050024946.dkr.ecr.$JL_AWS_REGION.amazonaws.com/$JL_MONGO_BACKUP_IMAGE_REPO_NAME:latest
+                    '''
+                }
+            }
+        }
+    }
+}
+
+
+/*
+
+stage('Original Step 10.3: Build and Push Mongo Backup Docker Image') {
+    steps {
+        script {
+            withCredentials([[ 
+                $class: 'AmazonWebServicesCredentialsBinding',
+                credentialsId: 'JL_AWS_CREDENTIALS',
+                accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+            ]]) {
+                withEnv([
+                    "JL_MONGO_BACKUP_IMAGE_REPO_NAME=${env.JL_MONGO_BACKUP_IMAGE_REPO_NAME}",
+                    "JL_AWS_REGION=${env.JL_AWS_REGION_ID}"
+                ]) {
+                    sh '''                    
+                    export DOCKER_BUILDKIT=0
+
+                    echo "📄 Writing Dockerfile..."
+cat > Dockerfile <<EOF
+FROM public.ecr.aws/docker/library/python:3.12
+
+RUN apt-get update && \
+    apt-get install -y gnupg curl && \
+    curl -fsSL https://pgp.mongodb.com/server-6.0.asc | gpg --dearmor -o /usr/share/keyrings/mongodb-server-6.0.gpg && \
+    echo "deb [ signed-by=/usr/share/keyrings/mongodb-server-6.0.gpg ] https://repo.mongodb.org/apt/debian bullseye/mongodb-org/6.0 main" | tee /etc/apt/sources.list.d/mongodb-org-6.0.list && \
+    apt-get update && \
+    apt-get install -y mongodb-database-tools && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir pymongo boto3
+
+COPY backup_script.py /app/backup_script.py
+
+CMD ["python", "/app/backup_script.py"]
+EOF
+
+                    echo "📄 Writing backup_script.py..."
+cat > backup_script.py << 'EOF'
+import os, boto3, subprocess, datetime
+
+mongo_uri = os.getenv("MONGO_URI")
+s3_bucket = os.getenv("S3_BUCKET")
+backup_prefix = os.getenv("S3_PREFIX", "mongodb_backups")
+
+timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+# Write dump to /tmp folder
+archive_name = f"/tmp/backup_{timestamp}.gz"
+# archive_name = f"backup_{timestamp}.gz"
+
+print("Current working dir:", os.getcwd())
+print("Archive path:", archive_name)
+
+subprocess.run([
+    "mongodump",
+    f"--uri={mongo_uri}",
+    "--archive=" + archive_name,
+    "--gzip"
+], check=True)
+
+s3 = boto3.client("s3")
+# Upload the file using only the filename in S3 key, not full path
+s3.upload_file(archive_name, s3_bucket, f"{backup_prefix}/{os.path.basename(archive_name)}")
+# s3.upload_file(archive_name, s3_bucket, f"{backup_prefix}/{archive_name}")
+
+print("Backup uploaded to S3 as", f"{backup_prefix}/{os.path.basename(archive_name)}")
+# print("Backup uploaded to S3 as", f"{backup_prefix}/{archive_name}")
+EOF
+
+                    echo "🛠️ Building MongoDB backup Docker image..."
+                    docker build -t $JL_MONGO_BACKUP_IMAGE_REPO_NAME .
+
+                    echo "🔑 Logging into ECR..."
+                    aws ecr get-login-password --region "$JL_AWS_REGION" | docker login --username AWS --password-stdin 975050024946.dkr.ecr."$JL_AWS_REGION".amazonaws.com
+
+                    echo "📤 Tagging and pushing to ECR..."
+                    docker tag $JL_MONGO_BACKUP_IMAGE_REPO_NAME:latest 975050024946.dkr.ecr.$JL_AWS_REGION.amazonaws.com/$JL_MONGO_BACKUP_IMAGE_REPO_NAME:latest
+                    docker push 975050024946.dkr.ecr.$JL_AWS_REGION.amazonaws.com/$JL_MONGO_BACKUP_IMAGE_REPO_NAME:latest
+                    '''
+                }
+            }
+        }
+    }
+}
+*/
+
+/*
+To Test if Original Step 10.3 successfully does backup of mongodb collection run it via Jenkins
+in place of current 10.3 above
+Note: Database backups will work both with and without the collection name
+then in you ec2 instance run the following:
+
+aws ecr get-login-password --region ap-south-1 | docker login --username AWS --password-stdin 975050024946.dkr.ecr.ap-south-1.amazonaws.com
+
+docker pull 975050024946.dkr.ecr.ap-south-1.amazonaws.com/jl-assignment-nine-mongo-atlas-backup-image:latest
+
+docker run --rm \
+  -e MONGO_URI="mongodb+srv://id:password@cluster0.aq7nu.mongodb.net/assignment_nine" \
+  -e S3_BUCKET="jl-joyston-assignment-nine-bucket" \
+  -e AWS_ACCESS_KEY_ID="<YOUR_AWS_ACCESS_KEY_ID>" \
+  -e AWS_SECRET_ACCESS_KEY="<YOUR_AWS_SECRET_ACCESS_KEY>" \
+  -e REGION="ap-south-1" \
+  975050024946.dkr.ecr.ap-south-1.amazonaws.com/jl-assignment-nine-mongo-atlas-backup-image:latest
+*/
+
+/*
+
+*/
+
+/*
+stage('Step 10.4: Deploy MongoDB Backup Lambda Function') {
+    steps {
+        script {
+            withCredentials([[ 
+                $class: 'AmazonWebServicesCredentialsBinding', 
+                credentialsId: 'JL_AWS_CREDENTIALS', 
+                accessKeyVariable: 'AWS_ACCESS_KEY_ID', 
+                secretKeyVariable: 'AWS_SECRET_ACCESS_KEY' 
+            ]]) {
+                withEnv([
+                    "JL_AWS_REGION=${env.JL_AWS_REGION_ID}",
+                    "JL_MONGO_BACKUP_LAMBDA_NAME=${env.JL_MONGO_BACKUP_LAMBDA_NAME}",
+                    "JL_MONGO_BACKUP_IMAGE_REPO_NAME=${env.JL_MONGO_BACKUP_IMAGE_REPO_NAME}",
+                    "JL_MONGO_ATLAS_URI=${env.JL_AS09_MONGO_URI_WITH_DB_NAME}",
+                    "JL_S3_BUCKET_NAME=${env.JL_S3_BUCKET_NAME}"
+                ]) {
+                    sh '''
+                    echo "🚀 Creating/Updating Lambda Function..."
+
+                    ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text --region "$JL_AWS_REGION")
+                    echo "🔍 Using AWS Account ID: $ACCOUNT_ID"
+
+                    echo "🔗 Checking if Lambda function exists..."
+                    if aws lambda get-function --function-name "$JL_MONGO_BACKUP_LAMBDA_NAME" --region "$JL_AWS_REGION" > /dev/null 2>&1; then
+                        echo "🔁 Updating existing Lambda..."
+                        aws lambda update-function-code \
+                          --function-name "$JL_MONGO_BACKUP_LAMBDA_NAME" \
+                          --image-uri "$ACCOUNT_ID.dkr.ecr.$JL_AWS_REGION.amazonaws.com/$JL_MONGO_BACKUP_IMAGE_REPO_NAME:latest" \
+                          --region "$JL_AWS_REGION"
+                    else
+                        echo "🆕 Creating new Lambda..."
+
+                        ROLE_NAME="${JL_MONGO_BACKUP_LAMBDA_NAME}-execution-role"
+
+                        echo "📜 Creating trust policy..."
+                        TRUST_FILE=trust-policy.json
+                        cat > $TRUST_FILE <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "lambda.amazonaws.com"
+      },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}
+EOF
+
+                        echo "🛡️ Creating IAM role (if not exists)..."
+                        if ! aws iam get-role --role-name "$ROLE_NAME" --region "$JL_AWS_REGION" > /dev/null 2>&1; then
+                          aws iam create-role \
+                            --role-name "$ROLE_NAME" \
+                            --assume-role-policy-document file://$TRUST_FILE \
+                            --region "$JL_AWS_REGION"
+
+                          echo "🔐 Attaching basic execution policy..."
+                          aws iam attach-role-policy \
+                            --role-name "$ROLE_NAME" \
+                            --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole \
+                            --region "$JL_AWS_REGION"
+                          
+                          echo "🔐 Attaching Amazon S3 Full Access policy..."
+                          aws iam attach-role-policy \
+                            --role-name "$ROLE_NAME" \
+                            --policy-arn arn:aws:iam::aws:policy/AmazonS3FullAccess \
+                            --region "$JL_AWS_REGION"
+                        
+                          aws iam attach-role-policy \
+                            --role-name "$ROLE_NAME" \
+                            --policy-arn arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly \
+                            --region "$JL_AWS_REGION"
+
+                          echo "🕐 Waiting for IAM role propagation..."
+                          sleep 10
+                        else
+                          echo "ℹ️ Role already exists. Skipping creation."
+                        fi
+
+                        echo "🚀 Creating Lambda with ECR image..."
+                        aws lambda create-function \
+                        --function-name "$JL_MONGO_BACKUP_LAMBDA_NAME" \
+                        --package-type Image \
+                        --code ImageUri="$ACCOUNT_ID.dkr.ecr.$JL_AWS_REGION.amazonaws.com/$JL_MONGO_BACKUP_IMAGE_REPO_NAME:latest" \
+                        --role "arn:aws:iam::$ACCOUNT_ID:role/$ROLE_NAME" \
+                        --timeout 900 \
+                        --memory-size 1024 \
+                        --region "$JL_AWS_REGION" \
+                        --environment "Variables={MONGO_URI='$JL_MONGO_ATLAS_URI',S3_BUCKET='$JL_S3_BUCKET_NAME',S3_PREFIX='mongodb_backups'}" \
+                        --output json
+
+                        echo "✅ Lambda function '$JL_MONGO_BACKUP_LAMBDA_NAME' created successfully."
+                    fi
+
+                    aws lambda get-function-configuration \
+                    --function-name "$JL_MONGO_BACKUP_LAMBDA_NAME" \
+                    --region "$JL_AWS_REGION" \
+                    --query 'Environment.Variables'
+
+                    echo "🧪 Invoking Lambda function to test backup..."
+                    aws lambda invoke \
+                    --function-name "$JL_MONGO_BACKUP_LAMBDA_NAME" \
+                    --region "$JL_AWS_REGION" \
+                    --log-type Tail \
+                    --query 'LogResult' \
+                    --output text \
+                    --payload '{}' \
+                    response.json | base64 -d
+
+                    echo "📦 Lambda returned:"
+                    cat response.json
+                    rm -f response.json
+
+                    echo "📄 Lambda output:"
+                    aws s3 ls "s3://$JL_S3_BUCKET_NAME/mongodb_backups/" --region "$JL_AWS_REGION"
+
+                    rm -f $TRUST_FILE
+                    '''
+                }
+            }
+        }
+    }
+}
+
+*/
 
 
 

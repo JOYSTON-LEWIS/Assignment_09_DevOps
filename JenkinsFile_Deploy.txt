@@ -230,14 +230,16 @@ EOF
 }
 
 
+/*
+WIP
 stage('Step 10.1: Generate Lambda Docker Files') {
-  steps {
+    steps {
     sshagent (credentials: ['JL_EC2_SSH_PRIVATE_KEY']) {
-      sh '''
+                    sh '''
         ssh -o StrictHostKeyChecking=no ubuntu@$JL_AS09_EC2_IP_ADDRESS << 'EOF'
 echo "✅ Connected to EC2"
 
-rm -rf mongo_lambda_backup
+                    rm -rf mongo_lambda_backup
 
 mkdir -p ~/mongo_lambda_backup && cd ~/mongo_lambda_backup
 
@@ -250,7 +252,6 @@ import boto3
 def lambda_handler(event, context=None):
     mongo_uri = event.get("MONGO_URI")
     s3_bucket = event.get("S3_BUCKET")
-    db_name = event.get("DB_NAME")
     region = event.get("REGION")
     aws_access_key = event.get("AWS_ACCESS_KEY_ID")
     aws_secret_key = event.get("AWS_SECRET_ACCESS_KEY")
@@ -275,7 +276,7 @@ def lambda_handler(event, context=None):
 PYEOF
 
 cat > Dockerfile << 'DOCKER'
-FROM public.ecr.aws/lambda/python:3.11-slim
+FROM public.ecr.aws/lambda/python:3.12
 
 RUN pip install boto3 pymongo
 
@@ -286,9 +287,9 @@ DOCKER
 
 echo "✅ Files created"
 EOF
-      '''
+                    '''
+                }
     }
-  }
 }
 
 
@@ -509,8 +510,11 @@ EOF
 
 
 
-/*
+*/
 
+
+/*
+WIP
 stage('Step 6.1: Deploy Backend EC2s in ASG') {
             steps {
                 sshagent (credentials: ['JL_EC2_SSH_PRIVATE_KEY']) {

@@ -12,9 +12,12 @@ mongoose.connect(process.env.MONGO_URL, { useNewUrlParser: true, useUnifiedTopol
 app.use(express.json());
 app.use(cors())
 
+app.get('/profilehome', (req,res)=>{
+    res.send({msg: 'Hello World'})
+})
 
-app.get('/health', (req,res)=>{
-    res.send({status: 'OK'})
+app.get('/profilehealth', (req,res)=>{
+    res.send({status: 'Profile Service OK'})
 })
 
 const userSchema = mongoose.Schema({

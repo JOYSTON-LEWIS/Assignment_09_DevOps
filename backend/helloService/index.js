@@ -8,11 +8,11 @@ app.use(cors())
 
 
 app.use(express.json());
-app.get('/', (req,res)=>{
+app.get('/hellohome', (req,res)=>{
     res.send({msg: 'Hello World'})
 })
-app.get('/health', (req,res)=>{
-    res.send({status: 'OK'})
+app.get('/hellohealth', (req,res)=>{
+    res.send({status: 'Hello Service OK'})
 })
 
 app.listen(process.env.PORT, () => {

@@ -1,0 +1,757 @@
+pipeline {
+    agent any
+
+    environment {
+        // AWS & Infra Credentials
+        JL_AWS_REGION_ID                = credentials('JL_AWS_REGION_ID')
+        JL_AWS_OUTPUT_FORMAT            = 'json'
+        JL_AS09_EC2_IP_ADDRESS          = credentials('JL_AS09_EC2_IP_ADDRESS')
+        JL_EC2_SSH_PRIVATE_KEY          = credentials('JL_EC2_SSH_PRIVATE_KEY')
+
+        // App & GitHub
+        JL_AS09_S3_BACKUP_BUCKET_NAME   = credentials('JL_AS09_S3_BACKUP_BUCKET_NAME')
+        JL_AS09_LAMBDA_ROLE_ARN         = credentials('JL_AS09_LAMBDA_ROLE_ARN')
+        JL_AS09_MONGO_URI_WITH_DB_NAME  = credentials('JL_AS09_MONGO_URI_WITH_DB_NAME')
+        JL_AS09_GITHUB_REPO_URL         = credentials('JL_AS09_GITHUB_REPO_URL')
+
+        // ASG Variables
+        JL_AS09_EC2_AMI_ID            = credentials('JL_AS09_EC2_AMI_ID')
+        JL_AS09_EC2_SUBNET_ID         = credentials('JL_AS09_EC2_SUBNET_ID')
+        JL_AS09_EC2_SECURITY_GROUP_ID = credentials('JL_AS09_EC2_SECURITY_GROUP_ID')
+        JL_AWS_EC2_KEY_PAIR_NAME      = credentials('JL_AWS_EC2_KEY_PAIR_NAME')
+        JL_AS09_EC2_INSTANCE_TYPE     = credentials('JL_AS09_EC2_INSTANCE_TYPE')
+
+        // Env Variables
+        JL_BACKEND_MS_01                    = 3001
+        JL_BACKEND_MS_02                    = 3002
+        JL_AS09_FRONTEND_BASE_DOMAIN_MS_01  = "hello.joydevlabs.com"
+        JL_AS09_FRONTEND_BASE_DOMAIN_MS_02  = "profile.joydevlabs.com"
+
+        JL_S3_BUCKET_NAME                   = "jl-joyston-assignment-nine-bucket"
+        JL_MONGO_BACKUP_IMAGE_REPO_NAME     = "jl-assignment-nine-mongo-atlas-backup-image"
+        JL_MONGO_BACKUP_LAMBDA_NAME         = "jl-assignment-nine-mongo-backup-fn"
+        JL_PROFILE_SERVICE_DB_NAME          = "assignment_nine" 
+    }
+
+    stages {
+
+         stage('Step 1: Install All Tools on EC2') {
+            steps {
+                withCredentials([[
+                    $class: 'AmazonWebServicesCredentialsBinding',
+                    credentialsId: 'JL_AWS_CREDENTIALS',
+                    accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                    secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                ]]) {
+                    sshagent (credentials: ['JL_EC2_SSH_PRIVATE_KEY']) {
+                        script {
+                            def SSH_IP = env.JL_AS09_EC2_IP_ADDRESS
+                            def REGION = env.JL_AWS_REGION_ID
+                            def OUTPUT = env.JL_AWS_OUTPUT_FORMAT
+                            def ACCESS_KEY = AWS_ACCESS_KEY_ID
+                            def SECRET_KEY = AWS_SECRET_ACCESS_KEY
+
+                            sh """
+                            ssh -o StrictHostKeyChecking=no ubuntu@${SSH_IP} << EOF
+echo "✅ Connected to EC2"
+
+# Update system and install packages
+sudo apt-get update -y
+sudo apt-get upgrade -y
+sudo apt-get install -y --install-recommends \\
+    docker.io curl git apt-transport-https software-properties-common \\
+    conntrack daemonize python3 python3-pip unzip jq
+
+# Add ubuntu to docker group
+sudo usermod -aG docker ubuntu
+
+# Fix kernel file protection
+sudo sysctl fs.protected_regular=0
+
+# Install kubectl
+curl -LO https://dl.k8s.io/release/v1.33.1/bin/linux/amd64/kubectl
+chmod +x kubectl && sudo mv kubectl /usr/local/bin/
+
+# Install Minikube
+curl -Lo minikube https://storage.googleapis.com/minikube/releases/v1.33.1/minikube-linux-amd64
+chmod +x minikube 
+sudo mv minikube /usr/local/bin/
+
+# Install Helm
+curl https://raw.githubusercontent.com/helm/helm/master/scripts/get-helm-3 | bash
+
+# Clean previous Minikube setup
+minikube delete --all --purge || true
+rm -rf ~/.minikube ~/.kube
+
+# Configure containerd
+cat <<EOF2 | sudo tee /etc/modules-load.d/k8s.conf
+overlay
+br_netfilter
+EOF2
+sudo modprobe overlay
+sudo modprobe br_netfilter
+
+cat <<EOF3 | sudo tee /etc/sysctl.d/k8s.conf
+net.bridge.bridge-nf-call-iptables  = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+net.ipv4.ip_forward                 = 1
+EOF3
+sudo sysctl --system
+
+# Install and enable containerd
+sudo apt-get install -y containerd
+sudo mkdir -p /etc/containerd
+sudo containerd config default | sudo tee /etc/containerd/config.toml
+sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+sudo systemctl enable --now containerd
+
+# Install crictl v1.33.0
+wget https://github.com/kubernetes-sigs/cri-tools/releases/download/v1.33.0/crictl-v1.33.0-linux-amd64.tar.gz
+tar -xvzf crictl-v1.33.0-linux-amd64.tar.gz
+sudo mv crictl /usr/local/bin/
+sudo chmod +x /usr/local/bin/crictl
+
+# Install CNI plugins
+wget https://github.com/containernetworking/plugins/releases/download/v1.5.0/cni-plugins-linux-amd64-v1.5.0.tgz
+sudo mkdir -p /opt/cni/bin
+sudo tar --overwrite -xvzf cni-plugins-linux-amd64-v1.5.0.tgz -C /opt/cni/bin/
+
+# Start Minikube with containerd (no driver)
+sudo CHANGE_MINIKUBE_NONE_USER=true minikube start --driver=none --container-runtime=containerd
+
+# Install boto3
+pip3 install --upgrade boto3 --break-system-packages
+
+# AWS CLI
+rm -rf aws awscliv2.zip
+curl \"https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip\" -o \"awscliv2.zip\"
+unzip -o awscliv2.zip
+sudo ./aws/install
+
+# Configure AWS CLI
+aws configure set aws_access_key_id "${ACCESS_KEY}"
+aws configure set aws_secret_access_key "${SECRET_KEY}"
+aws configure set region "${REGION}"
+aws configure set output "${OUTPUT}"
+
+echo "✅ AWS credentials configured inside EC2"
+
+# Install Terraform
+curl -fsSL "https://releases.hashicorp.com/terraform/1.9.5/terraform_1.9.5_linux_amd64.zip" -o terraform.zip
+unzip -o terraform.zip
+sudo mv terraform /usr/local/bin/
+rm -f terraform.zip
+
+# Install eksctl (for EKS cluster management if needed later)
+curl --silent --location "https://github.com/eksctl-io/eksctl/releases/latest/download/eksctl_\$(uname -s)_amd64.tar.gz" | tar xz -C /tmp
+sudo mv /tmp/eksctl /usr/local/bin
+eksctl version
+
+# Terraform
+terraform --version || echo "❌ Terraform not installed or not in PATH"
+
+# eksctl
+eksctl version || echo "❌ eksctl not installed or not in PATH"
+
+rm -rf aws awscliv2.zip terraform.zip crictl-*.tar.gz cni-plugins-*.tgz cni-plugins-*.tgz.* crictl-*.tar.gz.* /tmp/eksctl* ~/.minikube ~/.kube
+
+sudo apt-get clean
+sudo rm -rf ~/.cache
+
+EOF
+                        """
+                        }
+                    }
+                }
+            }
+        }
+
+
+
+        stage('Step 1: Clone GitHub Repo on EC2') {
+            steps {
+                sshagent (credentials: ['JL_EC2_SSH_PRIVATE_KEY']) {
+                    script {
+                        def SSH_IP = env.JL_AS09_EC2_IP_ADDRESS
+                        def GIT_REPO = env.JL_AS09_GITHUB_REPO_URL
+                        def repoName = GIT_REPO.split('/').last().replace('.git', '')
+
+                        sh """
+                        ssh -o StrictHostKeyChecking=no ubuntu@${SSH_IP} << EOF
+mkdir -p ~/assignment09 && cd ~/assignment09
+rm -rf ${repoName}
+git clone ${GIT_REPO}
+echo "✅ Repo cloned to ~/assignment09/${repoName}"
+EOF
+                        """
+                    }
+                }
+            }
+        }
+
+
+
+        stage('Step 2: Verify Repo Folder Structure & Validate Tools') {
+            steps {
+                sshagent (credentials: ['JL_EC2_SSH_PRIVATE_KEY']) {
+                    script {
+                        def SSH_IP = env.JL_AS09_EC2_IP_ADDRESS
+                        def GIT_REPO = env.JL_AS09_GITHUB_REPO_URL
+                        def repoName = GIT_REPO.split('/').last().replace('.git', '')
+                        def REMOTE_DIR = "~/assignment09/${repoName}"
+
+                        sh """
+ssh -o StrictHostKeyChecking=no ubuntu@${SSH_IP} << EOF
+set -e
+cd ${REMOTE_DIR}
+
+echo "📁 Verifying project structure..."
+if [ ! -d "frontend" ] || [ ! -d "backend/helloService" ] || [ ! -d "backend/profileService" ]; then
+    echo "❌ ERROR: Required folders missing!"
+    exit 1
+fi
+
+echo "✅ Folder structure is valid: frontend/, backend/helloService/, backend/profileService/"
+
+echo "🔍 Running validations for installed tools..."
+
+# Docker
+docker --version
+sudo systemctl is-active docker
+
+# Containerd
+containerd --version
+sudo systemctl is-active containerd
+
+# Kubernetes
+kubectl version --client=true --output=yaml
+minikube version
+crictl --version
+
+# CNI
+ls /opt/cni/bin | wc -l
+if [ ! -f /opt/cni/bin/bridge ]; then
+  echo "❌ CNI plugin 'bridge' missing"
+  exit 1
+fi
+
+# Helm
+helm version
+helm repo list || echo "⚠️ Helm may not be initialized"
+
+# Python & boto3
+python3 --version
+pip3 --version
+pip3 show boto3
+
+# Kernel modules and sysctl
+lsmod | grep br_netfilter
+lsmod | grep overlay
+
+sysctl net.bridge.bridge-nf-call-iptables
+sysctl net.ipv4.ip_forward
+
+# Docker group membership
+groups ubuntu | grep -qw docker || { echo "❌ 'ubuntu' user not in docker group"; exit 1; }
+
+# AWS CLI version check
+aws --version
+
+# AWS identity check (verifies credentials are configured)
+aws sts get-caller-identity || { echo "❌ AWS CLI is not configured correctly"; exit 1; }
+
+# Terraform
+terraform --version || { echo "❌ Terraform not installed or not in PATH"; exit 1; }
+
+# eksctl
+eksctl version || { echo "❌ eksctl not installed or not in PATH"; exit 1; }
+
+echo "✅ Tool validation complete"
+EOF
+                        """
+                    }
+                }
+            }
+        }
+
+
+
+stage('Step 3: Dockerize and Push to ECR') {
+    steps {
+        sshagent (credentials: ['JL_EC2_SSH_PRIVATE_KEY']) {
+            script {
+                def SSH_IP = env.JL_AS09_EC2_IP_ADDRESS
+                def GIT_REPO = env.JL_AS09_GITHUB_REPO_URL
+                def repoName = GIT_REPO.split('/').last().replace('.git', '')
+                def REMOTE_DIR = "~/assignment09/${repoName}"
+                def AWS_REGION = env.JL_AWS_REGION_ID
+
+                sh """
+                ssh -o StrictHostKeyChecking=no ubuntu@${SSH_IP} << 'EOF'
+set -e
+cd ${REMOTE_DIR}
+
+echo "🧹 Removing old Docker images..."
+docker rmi -f \$(docker images -q) || true
+
+echo "🐳 Creating Dockerfiles..."
+
+# helloService
+cat <<'EOT' > backend/helloService/Dockerfile
+FROM node:20.9.0-alpine
+WORKDIR /app
+COPY . .
+RUN npm install
+EXPOSE 3001
+CMD ["node", "index.js"]
+EOT
+
+# profileService
+cat <<'EOT' > backend/profileService/Dockerfile
+FROM node:20.9.0-alpine
+WORKDIR /app
+COPY . .
+RUN npm install
+EXPOSE 3002
+CMD ["node", "index.js"]
+EOT
+
+# frontend
+cat <<'EOT' > frontend/Dockerfile
+FROM node:20.9.0-alpine
+WORKDIR /app
+COPY . .
+RUN npm install
+EXPOSE 3000
+CMD ["npm", "start"]
+EOT
+
+echo "⬇️ Pulling base image..."
+docker pull node:20.9.0-alpine
+
+echo "🧹 Removing stale Docker credentials..."
+rm -f ~/.docker/config.json || true
+
+ACCOUNT_ID=\$(aws sts get-caller-identity --query Account --output text)
+ECR_BASE="\${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+
+for SERVICE in hello-service profile-service frontend; do
+  REPO_NAME="jl-assignment-nine-\$SERVICE"
+  IMAGE_TAG="\$REPO_NAME"
+
+  echo "📁 Checking/creating ECR repo: \$REPO_NAME"
+  aws ecr describe-repositories --repository-names \$REPO_NAME || \
+  aws ecr create-repository --repository-name \$REPO_NAME
+
+  echo "🔐 Logging into ECR..."
+  aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin \$ECR_BASE
+
+  echo "📤 Building and pushing: \$SERVICE"
+
+  if [ "\$SERVICE" = "frontend" ]; then
+    cd frontend
+  elif [ "\$SERVICE" = "hello-service" ]; then
+    cd backend/helloService
+  elif [ "\$SERVICE" = "profile-service" ]; then
+    cd backend/profileService
+  fi
+
+  docker build -t \$IMAGE_TAG .
+  docker tag \$IMAGE_TAG \$ECR_BASE/\$REPO_NAME
+  docker push \$ECR_BASE/\$REPO_NAME
+  cd - > /dev/null
+done
+
+echo "✅ All images built and pushed to ECR successfully."
+EOF
+                """
+            }
+        }
+    }
+}
+
+
+
+stage('Step 10.1: Generate Lambda Docker Files') {
+    steps {
+    sshagent (credentials: ['JL_EC2_SSH_PRIVATE_KEY']) {
+                    sh '''
+        ssh -o StrictHostKeyChecking=no ubuntu@$JL_AS09_EC2_IP_ADDRESS << 'EOF'
+echo "✅ Connected to EC2"
+
+                    rm -rf mongo_lambda_backup
+
+mkdir -p ~/mongo_lambda_backup && cd ~/mongo_lambda_backup
+
+cat > lambda_function.py << 'PYEOF'
+import os
+import subprocess
+import datetime
+import boto3
+
+def lambda_handler(event, context=None):
+    mongo_uri = event.get("MONGO_URI")
+    s3_bucket = event.get("S3_BUCKET")
+    region = event.get("REGION")
+    aws_access_key = event.get("AWS_ACCESS_KEY_ID")
+    aws_secret_key = event.get("AWS_SECRET_ACCESS_KEY")
+
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    filename = f"mongodb_backup_{timestamp}.gz"
+    s3_key = f"mongodb_backups/{filename}"
+
+    os.environ["AWS_ACCESS_KEY_ID"] = aws_access_key
+    os.environ["AWS_SECRET_ACCESS_KEY"] = aws_secret_key
+    os.environ["AWS_DEFAULT_REGION"] = region
+
+    dump_cmd = f"mongodump --uri=\\"{mongo_uri}\\" --archive={filename} --gzip"
+    subprocess.run(dump_cmd, shell=True, check=True)
+
+    s3 = boto3.client("s3", region_name=region)
+    with open(filename, "rb") as f:
+        s3.upload_fileobj(f, s3_bucket, s3_key)
+
+    print(f"✅ Backup uploaded to S3: {s3_key}")
+    return {"status": "success", "s3_key": s3_key}
+PYEOF
+
+cat > Dockerfile << 'DOCKER'
+FROM public.ecr.aws/lambda/python:3.11-slim
+
+RUN pip install boto3 pymongo
+
+COPY lambda_function.py ./
+
+CMD [ "lambda_function.lambda_handler" ]
+DOCKER
+
+echo "✅ Files created"
+EOF
+                    '''
+                }
+    }
+}
+
+
+stage('Step 10.2: Ensure Mongo Backup ECR Repo Exists') {
+    steps {
+        script {
+            withCredentials([[
+                $class: 'AmazonWebServicesCredentialsBinding',
+                credentialsId: 'JL_AWS_CREDENTIALS',
+                accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+            ]]) {
+                withEnv([
+                    "JL_MONGO_BACKUP_IMAGE_REPO_NAME=${env.JL_MONGO_BACKUP_IMAGE_REPO_NAME}",
+                    "JL_AWS_REGION=${env.JL_AWS_REGION_ID}"
+                ]) {
+                    sh '''
+                    echo "🔍 Checking if ECR repo exists..."
+                    if ! aws ecr describe-repositories --region "$JL_AWS_REGION" --repository-names "$JL_MONGO_BACKUP_IMAGE_REPO_NAME" > /dev/null 2>&1; then
+                        echo "📦 Creating ECR repo: $JL_MONGO_BACKUP_IMAGE_REPO_NAME"
+                        aws ecr create-repository --repository-name "$JL_MONGO_BACKUP_IMAGE_REPO_NAME" --region "$JL_AWS_REGION"
+                    else
+                        echo "✅ ECR repo already exists: $JL_MONGO_BACKUP_IMAGE_REPO_NAME"
+                    fi
+                    '''
+                }
+            }
+        }
+    }
+}
+
+
+
+
+stage('Step 10.3: Build and Push Mongo Backup Docker Image') {
+    steps {
+        script {
+            withCredentials([[ 
+                $class: 'AmazonWebServicesCredentialsBinding',
+                credentialsId: 'JL_AWS_CREDENTIALS',
+                accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+            ]]) {
+                withEnv([
+                    "JL_MONGO_BACKUP_IMAGE_REPO_NAME=${env.JL_MONGO_BACKUP_IMAGE_REPO_NAME}",
+                    "JL_AWS_REGION=${env.JL_AWS_REGION_ID}"
+                ]) {
+                    sh '''                    
+                    export DOCKER_BUILDKIT=0
+
+                    echo "📄 Writing Dockerfile..."
+cat > Dockerfile <<EOF
+FROM public.ecr.aws/docker/library/python:3.11-slim
+
+RUN apt-get update && \
+    apt-get install -y gnupg curl && \
+    curl -fsSL https://pgp.mongodb.com/server-6.0.asc | gpg --dearmor -o /usr/share/keyrings/mongodb-server-6.0.gpg && \
+    echo "deb [ signed-by=/usr/share/keyrings/mongodb-server-6.0.gpg ] https://repo.mongodb.org/apt/debian bullseye/mongodb-org/6.0 main" | tee /etc/apt/sources.list.d/mongodb-org-6.0.list && \
+    apt-get update && \
+    apt-get install -y mongodb-database-tools && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir pymongo boto3
+
+COPY backup_script.py /app/backup_script.py
+
+CMD ["python", "/app/backup_script.py"]
+EOF
+
+                    echo "📄 Writing backup_script.py..."
+cat > backup_script.py << 'EOF'
+import os, boto3, subprocess, datetime
+
+mongo_uri = os.getenv("MONGO_URI")
+s3_bucket = os.getenv("S3_BUCKET")
+backup_prefix = os.getenv("S3_PREFIX", "mongodb_backups")
+
+timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+# Write dump to /tmp folder
+archive_name = f"/tmp/backup_{timestamp}.gz"
+# archive_name = f"backup_{timestamp}.gz"
+
+print("Current working dir:", os.getcwd())
+print("Archive path:", archive_name)
+
+subprocess.run([
+    "mongodump",
+    f"--uri={mongo_uri}",
+    "--archive=" + archive_name,
+    "--gzip"
+], check=True)
+
+s3 = boto3.client("s3")
+# Upload the file using only the filename in S3 key, not full path
+s3.upload_file(archive_name, s3_bucket, f"{backup_prefix}/{os.path.basename(archive_name)}")
+# s3.upload_file(archive_name, s3_bucket, f"{backup_prefix}/{archive_name}")
+
+print("Backup uploaded to S3 as", f"{backup_prefix}/{os.path.basename(archive_name)}")
+# print("Backup uploaded to S3 as", f"{backup_prefix}/{archive_name}")
+EOF
+
+                    echo "🛠️ Building MongoDB backup Docker image..."
+                    docker build -t $JL_MONGO_BACKUP_IMAGE_REPO_NAME .
+
+                    echo "🔑 Logging into ECR..."
+                    aws ecr get-login-password --region "$JL_AWS_REGION" | docker login --username AWS --password-stdin 975050024946.dkr.ecr."$JL_AWS_REGION".amazonaws.com
+
+                    echo "📤 Tagging and pushing to ECR..."
+                    docker tag $JL_MONGO_BACKUP_IMAGE_REPO_NAME:latest 975050024946.dkr.ecr.$JL_AWS_REGION.amazonaws.com/$JL_MONGO_BACKUP_IMAGE_REPO_NAME:latest
+                    docker push 975050024946.dkr.ecr.$JL_AWS_REGION.amazonaws.com/$JL_MONGO_BACKUP_IMAGE_REPO_NAME:latest
+                    '''
+                }
+            }
+        }
+    }
+}
+*/
+
+/*
+stage('Step 10.1: Generate Lambda Docker Files') {
+    steps {
+    sshagent (credentials: ['JL_EC2_SSH_PRIVATE_KEY']) {
+                    sh '''
+        ssh -o StrictHostKeyChecking=no ubuntu@$JL_AS09_EC2_IP_ADDRESS << 'EOF'
+echo "✅ Connected to EC2"
+
+                    rm -rf mongo_lambda_backup
+
+mkdir -p ~/mongo_lambda_backup && cd ~/mongo_lambda_backup
+
+cat > lambda_function.py << 'PYEOF'
+import os
+import subprocess
+import datetime
+import boto3
+
+def lambda_handler(event, context=None):
+    mongo_uri = event.get("MONGO_URI")
+    s3_bucket = event.get("S3_BUCKET")
+    region = event.get("REGION")
+    aws_access_key = event.get("AWS_ACCESS_KEY_ID")
+    aws_secret_key = event.get("AWS_SECRET_ACCESS_KEY")
+
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    filename = f"mongodb_backup_{timestamp}.gz"
+    s3_key = f"mongodb_backups/{filename}"
+
+    os.environ["AWS_ACCESS_KEY_ID"] = aws_access_key
+    os.environ["AWS_SECRET_ACCESS_KEY"] = aws_secret_key
+    os.environ["AWS_DEFAULT_REGION"] = region
+
+    dump_cmd = f"mongodump --uri=\\"{mongo_uri}\\" --archive={filename} --gzip"
+    subprocess.run(dump_cmd, shell=True, check=True)
+
+    s3 = boto3.client("s3", region_name=region)
+    with open(filename, "rb") as f:
+        s3.upload_fileobj(f, s3_bucket, s3_key)
+
+    print(f"✅ Backup uploaded to S3: {s3_key}")
+    return {"status": "success", "s3_key": s3_key}
+PYEOF
+
+cat > Dockerfile << 'DOCKER'
+FROM public.ecr.aws/lambda/python:3.12
+
+RUN pip install boto3 pymongo
+
+COPY lambda_function.py ./
+
+CMD [ "lambda_function.lambda_handler" ]
+DOCKER
+
+echo "✅ Files created"
+EOF
+                    '''
+                }
+    }
+}
+
+
+stage('Step 10.2: Ensure Mongo Backup ECR Repo Exists') {
+    steps {
+        script {
+            withCredentials([[
+                $class: 'AmazonWebServicesCredentialsBinding',
+                credentialsId: 'JL_AWS_CREDENTIALS',
+                accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+            ]]) {
+                withEnv([
+                    "JL_MONGO_BACKUP_IMAGE_REPO_NAME=${env.JL_MONGO_BACKUP_IMAGE_REPO_NAME}",
+                    "JL_AWS_REGION=${env.JL_AWS_REGION_ID}"
+                ]) {
+                    sh '''
+                    echo "🔍 Checking if ECR repo exists..."
+                    if ! aws ecr describe-repositories --region "$JL_AWS_REGION" --repository-names "$JL_MONGO_BACKUP_IMAGE_REPO_NAME" > /dev/null 2>&1; then
+                        echo "📦 Creating ECR repo: $JL_MONGO_BACKUP_IMAGE_REPO_NAME"
+                        aws ecr create-repository --repository-name "$JL_MONGO_BACKUP_IMAGE_REPO_NAME" --region "$JL_AWS_REGION"
+                    else
+                        echo "✅ ECR repo already exists: $JL_MONGO_BACKUP_IMAGE_REPO_NAME"
+                    fi
+                    '''
+                }
+            }
+        }
+    }
+}
+
+stage('Modified Step 10.3: Build and Push Mongo Backup Docker Image') {
+    steps {
+        script {
+            withCredentials([[ 
+                $class: 'AmazonWebServicesCredentialsBinding',
+                credentialsId: 'JL_AWS_CREDENTIALS',
+                accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+            ]]) {
+                withEnv([
+                    "JL_MONGO_BACKUP_IMAGE_REPO_NAME=${env.JL_MONGO_BACKUP_IMAGE_REPO_NAME}",
+                    "JL_AWS_REGION=${env.JL_AWS_REGION_ID}"
+                ]) {
+                    sh '''                    
+                    export DOCKER_BUILDKIT=0
+
+                    echo "📄 Writing Dockerfile..."
+cat > Dockerfile <<EOF
+FROM debian:bullseye-slim as builder
+
+RUN apt-get update && apt-get install -y gnupg curl
+
+RUN curl -fsSL https://pgp.mongodb.com/server-6.0.asc | gpg --dearmor -o /usr/share/keyrings/mongodb-server-6.0.gpg
+
+RUN echo "deb [signed-by=/usr/share/keyrings/mongodb-server-6.0.gpg] https://repo.mongodb.org/apt/debian bullseye/mongodb-org/6.0 main" > /etc/apt/sources.list.d/mongodb-org-6.0.list
+
+RUN apt-get update && apt-get install -y mongodb-database-tools
+
+FROM public.ecr.aws/lambda/python:3.12
+
+COPY --from=builder /usr/bin/mongodump /usr/bin/mongodump
+
+RUN pip install --no-cache-dir pymongo boto3
+
+WORKDIR /var/task
+
+COPY backup_script.py .
+
+CMD ["backup_script.lambda_handler"]
+EOF
+
+                    echo "📄 Writing backup_script.py..."
+cat > backup_script.py << 'EOF'
+import os, boto3, subprocess, datetime, sys
+
+mongo_uri = os.getenv("MONGO_URI")
+s3_bucket = os.getenv("S3_BUCKET")
+backup_prefix = os.getenv("S3_PREFIX", "mongodb_backups")
+
+def run_backup():
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    # Write dump to /tmp folder (writable in Lambda)
+    archive_name = f"/tmp/backup_{timestamp}.gz"
+
+    print("Current working dir:", os.getcwd())
+    print("Archive path:", archive_name)
+
+    subprocess.run([
+        "mongodump",
+        f"--uri={mongo_uri}",
+        "--archive=" + archive_name,
+        "--gzip"
+    ], check=True)
+
+    s3 = boto3.client("s3")
+    s3.upload_file(archive_name, s3_bucket, f"{backup_prefix}/{os.path.basename(archive_name)}")
+    print("Backup uploaded to S3 as", f"{backup_prefix}/{os.path.basename(archive_name)}")
+
+def lambda_handler(event, context):
+    try:
+        run_backup()
+        return {"status": "success"}
+    except Exception as e:
+        print("Backup failed:", e)
+        return {"status": "error", "message": str(e)}
+
+# if __name__ == "__main__":
+    # For local debugging, exit with status 0 on success
+    # try:
+        # run_backup()
+        # sys.exit(0)
+    # except Exception as e:
+        # print("Backup failed:", e)
+        # sys.exit(1)
+EOF
+
+                    echo "🛠️ Building MongoDB backup Docker image..."
+                    docker build -t $JL_MONGO_BACKUP_IMAGE_REPO_NAME .
+
+                    echo "🔑 Logging into ECR..."
+                    aws ecr get-login-password --region "$JL_AWS_REGION" | docker login --username AWS --password-stdin 975050024946.dkr.ecr."$JL_AWS_REGION".amazonaws.com
+
+                    echo "📤 Tagging and pushing to ECR..."
+                    docker tag $JL_MONGO_BACKUP_IMAGE_REPO_NAME:latest 975050024946.dkr.ecr.$JL_AWS_REGION.amazonaws.com/$JL_MONGO_BACKUP_IMAGE_REPO_NAME:latest
+                    docker push 975050024946.dkr.ecr.$JL_AWS_REGION.amazonaws.com/$JL_MONGO_BACKUP_IMAGE_REPO_NAME:latest
+                    '''
+                }
+            }
+        }
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+    }
+}
